@@ -1,0 +1,117 @@
+package server
+
+import (
+	"compress/gzip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// v0.4.41: data-file preview parsing — five shapes: JSON array/object/JSONL/CSV/text.
+func TestParseJSONPreviewArray(t *testing.T) {
+	raw := `[{"order":"A1","amount":100},{"order":"A2","amount":200},{"order":"A3","amount":300}]`
+	r := parseJSONPreview(raw)
+	if r.Type != "json" || r.TotalRows != 3 || r.Truncated {
+		t.Fatalf("meta=%+v", r)
+	}
+	if len(r.Columns) != 2 || r.Columns[0] != "amount" || r.Columns[1] != "order" {
+		t.Fatalf("columns=%v", r.Columns)
+	}
+	if len(r.Rows) != 3 || r.Rows[0][1] != "A1" {
+		t.Fatalf("rows=%v", r.Rows)
+	}
+}
+
+func TestParseJSONPreviewObjectAndFallback(t *testing.T) {
+	r := parseJSONPreview(`{"code":"200","msg":"ok"}`)
+	if r.Type != "json" || r.TotalRows != 1 || len(r.Columns) != 2 {
+		t.Fatalf("object meta=%+v", r)
+	}
+	// invalid JSON → fall back to text
+	r2 := parseJSONPreview("content that is not JSON")
+	if r2.Type != "text" || !strings.Contains(r2.Text, "not JSON") {
+		t.Fatalf("fallback=%+v", r2)
+	}
+}
+
+func TestParseJSONLAndCSV(t *testing.T) {
+	jl := "{\"user\":\"u1\"}\n{\"user\":\"u2\"}\n\n"
+	r := parseJSONLPreview(jl)
+	if r.TotalRows != 2 || len(r.Rows) != 2 || r.Columns[0] != "user" {
+		t.Fatalf("jsonl=%+v", r)
+	}
+	csvRaw := "name,role\nalice,admin\nbob,user\n"
+	rc := parseCSVPreview(csvRaw, "csv")
+	if rc.TotalRows != 2 || len(rc.Columns) != 2 || rc.Rows[0][0] != "alice" {
+		t.Fatalf("csv=%+v", rc)
+	}
+	tsv := "a\tb\n1\t2\n"
+	rt := parseCSVPreview(tsv, "tsv")
+	if len(rt.Columns) != 2 || rt.Rows[0][1] != "2" {
+		t.Fatalf("tsv=%+v", rt)
+	}
+}
+
+func TestParseTextPreviewTruncates(t *testing.T) {
+	lines := make([]string, dataPreviewMaxLines+50)
+	for i := range lines {
+		lines[i] = "line"
+	}
+	r := parseTextPreview(strings.Join(lines, "\n"))
+	if r.Type != "text" || !r.Truncated || r.TotalRows != dataPreviewMaxLines+50 {
+		t.Fatalf("meta=%+v", r)
+	}
+	if got := strings.Count(r.Text, "\n") + 1; got != dataPreviewMaxLines {
+		t.Fatalf("text lines=%d want %d", got, dataPreviewMaxLines)
+	}
+}
+
+// API envelope {code,msg,data:[...]} auto-drills into the data array (the most common
+// production response shape).
+func TestParseJSONPreviewEnvelope(t *testing.T) {
+	raw := `{"code":"200","msg":"ok","data":[{"order":"A1","amount":100},{"order":"A2","amount":200}]}`
+	r := parseJSONPreview(raw)
+	if r.Envelope != "data" {
+		t.Fatalf("envelope=%q want data", r.Envelope)
+	}
+	if r.TotalRows != 2 || len(r.Rows) != 2 || r.Rows[0][1] != "A1" {
+		t.Fatalf("rows=%v", r.Rows)
+	}
+}
+
+func TestDataPreviewKindExt(t *testing.T) {
+	cases := map[string]string{
+		"a.json": "json", "b.jsonl": "jsonl", "c.csv": "csv", "d.tsv": "tsv",
+		"e.gz": "gz", "f.zip": "zip", "g.xml": "text", "h.yaml": "text",
+		"i.sql": "text", "j.log": "text", "k.md": "text", "l.txt": "text",
+		"m.out": "text", "n.diff": "text",
+	}
+	for name, want := range cases {
+		if got := dataPreviewKind(name); got != want {
+			t.Errorf("kind(%q)=%q want %q", name, got, want)
+		}
+	}
+}
+
+func TestParseGZDataset(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "orders.json.gz")
+	f, _ := os.Create(p)
+	zw := gzip.NewWriter(f)
+	_, _ = zw.Write([]byte(`[{"k":"v1"},{"k":"v2"}]`))
+	zw.Close()
+	f.Close()
+
+	raw, inner, zipRes, err := expandArtifact(p, "orders.json.gz")
+	if err != nil || zipRes != nil {
+		t.Fatalf("expand err=%v zipRes=%v", err, zipRes)
+	}
+	if inner != "orders.json" {
+		t.Fatalf("inner=%q want orders.json", inner)
+	}
+	res := parseDataPreview(dataPreviewKind(inner), raw)
+	if res.Type != "json" || res.TotalRows != 2 || res.Rows[0][0] != "v1" {
+		t.Fatalf("res=%+v", res)
+	}
+}

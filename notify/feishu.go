@@ -1,0 +1,209 @@
+package notify
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+)
+
+// feishuChannel implements the Feishu (incl. Lark) custom bot via interactive cards.
+//
+// Platform traits:
+//   - Its signing algorithm **differs** from DingTalk's and is easy to get wrong — see
+//     feishuSign.
+//   - Like DingTalk, business errors ride inside HTTP 200 bodies (code != 0).
+//   - Card headers take color templates; severity-mapped colors make severity obvious in the
+//     message list.
+type feishuChannel struct{}
+
+func (feishuChannel) Kind() string { return KindFeishu }
+
+// Feishu custom bots allow ~5 calls/s ≈ 100/min.
+func (feishuChannel) DefaultRatePerMin() int { return 100 }
+
+// The webhook URL's last segment is the bot's unique id — a credential.
+func (feishuChannel) SecretKeys() []string { return []string{"webhook", "secret"} }
+
+// Same rule: a new webhook URL requires re-affirming the signing secret.
+func (feishuChannel) DestinationKeys() []string { return []string{"webhook"} }
+
+func (feishuChannel) Validate(cfg map[string]any) error {
+	hook := cfgString(cfg, "webhook")
+	if hook == "" {
+		return errors.New("missing webhook URL")
+	}
+	if err := validateHTTPURL(hook); err != nil {
+		return fmt.Errorf("invalid webhook URL: %w", err)
+	}
+	return nil
+}
+
+func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
+	if err := c.Validate(cfg); err != nil {
+		return 0, Permanent(err)
+	}
+	card, kept := feishuCard(m)
+	payload := map[string]any{
+		"msg_type": "interactive",
+		"card":     card,
+	}
+	// Signing params sit at message level and appear only when a secret is configured.
+	if secret := cfgString(cfg, "secret"); secret != "" {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		payload["timestamp"] = ts
+		payload["sign"] = feishuSign(ts, secret)
+	}
+	raw, err := doJSON(ctx, "POST", cfgString(cfg, "webhook"), nil, payload)
+	if err != nil {
+		return 0, err
+	}
+	var res struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		// Some Feishu hook versions use this field set — supported too.
+		StatusCode    int    `json:"StatusCode"`
+		StatusMessage string `json:"StatusMessage"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return 0, fmt.Errorf("failed to parse Feishu response: %w (%s)", err, snippet(raw))
+	}
+	if res.Code != 0 {
+		return 0, Permanent(fmt.Errorf("Feishu error %d: %s", res.Code, res.Msg))
+	}
+	if res.StatusCode != 0 {
+		return 0, Permanent(fmt.Errorf("Feishu error %d: %s", res.StatusCode, res.StatusMessage))
+	}
+	return kept, nil
+}
+
+// feishuSign computes the signature per Feishu's official rules.
+//
+// The classic trap: the official sample is
+//
+//	hmac.new(string_to_sign.encode(), digestmod=sha256)
+//
+// i.e. **key = timestamp + "\n" + secret, message empty** — not the intuitive
+// 'key=secret, message=stringToSign', which is DingTalk's algorithm. The two are exactly
+// inverted; copying the other's implementation guarantees a signature failure (error 19021).
+func feishuSign(timestamp, secret string) string {
+	stringToSign := timestamp + "\n" + secret
+	mac := hmac.New(sha256.New, []byte(stringToSign))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// feishuSeverityTemplate maps vuln severity to a card-header color template.
+// Unknown → grey, not blue (would clash with low).
+func feishuSeverityTemplate(severity string) string {
+	switch severity {
+	case "critical":
+		return "red"
+	case "high":
+		return "orange"
+	case "medium":
+		return "yellow"
+	case "low":
+		return "blue"
+	default:
+		return "grey"
+	}
+}
+
+// feishuMaxCardBytes is a conservative card-content cap. Feishu limits card size — oversize
+// rejects the message; stay well under the official cap to cover JSON wrapping overhead.
+const feishuMaxCardBytes = 24000
+
+// feishuCard builds the interactive card, returning the card and **actually written items**.
+// kept means what it does in markdownBody: only items that made it into the card may be
+// marked delivered.
+func feishuCard(m Message) (map[string]any, int) {
+	elements := []any{}
+	kept := 0
+	if m.Batch {
+		// Pack whole items first, then compose the header: it must say 'N more items continue in
+		// the next message', and N must come from what actually fit.
+		kept = packItemCount(m.Items, feishuMaxCardBytes, markdownReservedBytes, "", byteSize, func(it Item, idx int) string {
+			return feishuBatchLine(it, idx+1)
+		})
+		items := m.Items[:kept]
+		elements = append(elements, feishuMarkdownDiv(markdownBatchIntro(m, items, len(m.Items))))
+		for i, it := range items {
+			elements = append(elements, feishuMarkdownDiv(feishuBatchLine(it, i+1)))
+		}
+		if m.HomeURL != "" {
+			elements = append(elements, feishuButton("View all in platform", m.HomeURL))
+		}
+	} else if len(m.Items) > 0 {
+		kept = 1
+		it := m.Items[0]
+		elements = append(elements, feishuMarkdownDiv(feishuItemLines(it)))
+		if it.DetailURL != "" {
+			elements = append(elements, feishuButton("View details", it.DetailURL))
+		}
+	}
+
+	card := map[string]any{
+		"config":   map[string]any{"wide_screen_mode": true},
+		"header":   map[string]any{"title": map[string]any{"tag": "plain_text", "content": markdownTitle(m)}},
+		"elements": elements,
+	}
+	if len(m.Items) > 0 {
+		card["header"].(map[string]any)["template"] = feishuSeverityTemplate(m.Items[0].Severity)
+	}
+	return card, kept
+}
+
+func feishuMarkdownDiv(content string) map[string]any {
+	return map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": content}}
+}
+
+func feishuButton(label, url string) map[string]any {
+	return map[string]any{
+		"tag": "action",
+		"actions": []any{map[string]any{
+			"tag":  "button",
+			"text": map[string]any{"tag": "lark_md", "content": label},
+			"url":  url,
+			"type": "primary",
+		}},
+	}
+}
+
+// feishuItemLines renders one vuln's lark_md body.
+//
+// lark_md is markdown's sibling — links and emphasis parse the same way — so all external
+// fields go through markdownText (single-line + escape). Otherwise one vuln title becomes a
+// clickable external link inside Feishu.
+func feishuItemLines(it Item) string {
+	out := fmt.Sprintf("**%s · %s**", SeverityLabel(it.Severity), markdownText(it.Title(), 0))
+	if it.IsStatusChange() {
+		out += fmt.Sprintf("\n**Status change**: %s → %s",
+			markdownText(StatusLabel(it.FromStatus), 0), markdownText(StatusLabel(it.ToStatus), 0))
+	}
+	if it.VulnClass != "" && it.VulnClass != it.Title() {
+		out += fmt.Sprintf("\n**Type**: %s", markdownText(it.VulnClass, 0))
+	}
+	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+		out += fmt.Sprintf("\n**Assets**: %s", markdownText(a, 0))
+	}
+	if it.Summary != "" {
+		if s := markdownText(it.Summary, maxSummaryRunes); s != "" {
+			out += fmt.Sprintf("\n**Summary**: %s", s)
+		}
+	}
+	return out
+}
+
+// feishuBatchLine renders one digest-card line.
+func feishuBatchLine(it Item, index int) string {
+	line := fmt.Sprintf("**%d. %s · %s**", index, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
+	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+		line += " — " + markdownText(a, 0)
+	}
+	return line
+}

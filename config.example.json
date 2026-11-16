@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy as config.json (or use the POJUN_CONFIG environment variable to point at another path). This file only contains the `database` and `skill_dir` keys; LLM and all other configuration comes from environment variables or in-app settings, not this file.",
+
+  "_comment_database": "PostgreSQL connection. Precedence: env var POJUN_PG_DSN > this file's `database`. Two styles, pick one: (A) fill in the individual fields below; (B) set only `database.dsn` to a full connection string.",
+  "database": {
+    "host": "127.0.0.1",
+    "port": 5433,
+    "user": "pojun",
+    "password": "",
+    "dbname": "pojun",
+    "sslmode": "disable"
+  },
+
+  "_comment_database_dsn": "Style (B): delete the `database` block above and use a full DSN instead. When dsn is non-empty, the individual fields are ignored.",
+  "_example_database_dsn": {
+    "database": {
+      "dsn": "postgres://user:pass@db.example.com:5432/pojun?sslmode=require"
+    }
+  },
+
+  "_comment_skill_dir": "Skill root directory (one skill per subdirectory, each containing a SKILL.md). Precedence: env var POJUN_SKILL_DIR > this field > default (skills/ next to the executable). Leave empty or delete this field to use the default. Relative paths resolve against the current working directory.",
+  "skill_dir": "/opt/pojun/skills"
+}

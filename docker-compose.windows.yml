@@ -1,0 +1,42 @@
+# Windows-only override (Docker Desktop / WSL2 backend).
+#
+# Usage (applied together with the main compose file):
+#   cp .env.example .env      # change at least POSTGRES_PASSWORD
+#   docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d
+#
+# Why this override is needed:
+# The main compose mounts data/ into the container as a bind mount. On Linux
+# that is a convenience ("inspect/back up directly from the host"); on Windows,
+# though, bind mounts go through the NTFS <-> WSL2 I/O channel, where small-file
+# reads/writes measure about two orders of magnitude slower (500 x 4KB files:
+# ~108x slower writes / ~328x slower reads). Pojun's traffic records, evidence
+# attachments and task workspaces are all small-file heavy — this must be
+# avoided. So data/ is swapped for a named volume (which lives in WSL2's Linux
+# filesystem, at container-layer speed). Back up with:
+#   docker run --rm -v pojun-data:/data -v "%cd%:/backup" alpine \
+#     tar czf /backup/pojun-data.tgz -C /data .
+#
+# skills/ stays a bind mount: skill files are few, small and read-only, so the
+# NTFS read penalty is acceptable — and it keeps the convenience of "edit a
+# skill without rebuilding the image".
+#
+# Reverse-connection listener (reverse shell) note: the LHOST resolved in
+# `direct` mode inside the container is a container-subnet IP that external
+# targets cannot reach. On Windows deployments, set the egress mode to
+# `manual` on the "Listeners / C2" page, fill in the Windows host's LAN IP as
+# the address, and open the reverse-connection port mapping below (ports map
+# 1:1 — e.g. to listen on 4444, map 4444:4444).
+
+services:
+  pojun:
+    volumes:
+      # Overrides the main compose's ./data:/app/data — this file wins for the
+      # same mount target
+      - pojun-data:/app/data
+    ports:
+      # Reverse-connection port range mapping (add/remove as needed; in manual
+      # mode set LHOST to the host IP):
+      - "4444-4450:4444-4450"
+
+volumes:
+  pojun-data:

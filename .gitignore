@@ -1,0 +1,64 @@
+# Build artifacts
+/pojun
+/pojun.exe
+/pojun-*
+/artex
+/artex.exe
+/artex-*
+/dist/
+*.zip
+SHA256SUMS
+
+# Frontend dev artifacts
+/web/node_modules/
+/web/.next/
+/web/src/.next/
+/web/out/
+/web/.turbo/
+/web/.vercel/
+
+# Go embed build artifacts (generated at build time, not committed)
+/server/webui/dist/
+/server/web/
+
+# Environment and sensitive config
+.env
+*.pem
+*.key
+*.crt
+config.json
+*.sqlite
+*.db
+
+# Data directories
+/data/
+/pgdata/
+*.sqlite
+*.db
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*-events.csv
+/bench/
+/Dockerfile.bench
+/Dockerfile.bench.v2
+
+# Python cache
+__pycache__/
+*.pyc
+.build-tmp/
+peers/
+
+# Tool runtime files
+.v2c/
+.video_agent/

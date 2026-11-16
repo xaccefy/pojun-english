@@ -1,0 +1,111 @@
+# macOS install-script smoke test on real hardware: on GitHub's macos-15 (Apple Silicon) runner,
+# run the full Darwin branch of install.sh to verify that "install with one command" works on real macOS.
+#
+# Coverage (the macOS counterpart aligned with the Linux install.sh flow):
+#   Homebrew detect/reuse -> postgresql@16 install and service-ification (brew services = launchd) ->
+#   Release darwin package download and SHA256 verification -> config.json generation -> launchd user-level service
+#   (KeepAlive) -> /api/health 200 -> idempotent re-run (upgrade path leaves data untouched).
+#
+# Out of scope: the LibreOffice cask (~400MB download, only hinted at, not installed), the pentest toolchain,
+# pojun-hostd (macOS never supported it). The docs state this honestly.
+#
+# The runner is macos-15 (ARM): macos-14 has been retired by GitHub (the label is unavailable).
+# The version defaults to smoke-testing the current latest Release (with -y, non-interactive).
+
+name: macos-install-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - ".github/workflows/macos-install-smoke.yml"
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # The smoke test pins an explicit released version so latest moving cannot make it unreproducible;
+      # the version has a darwin package since v0.4.66.
+      POJUN_SMOKE_VERSION: v0.4.66
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pre-flight
+        run: |
+          sw_vers
+          uname -m
+          brew --version | head -1
+          curl --version | head -1
+          python3 --version
+
+      - name: Run install.sh (macOS / binary / non-interactive)
+        run: |
+          set -o pipefail
+          bash install.sh --mode=binary -y --version="$POJUN_SMOKE_VERSION" 2>&1 | tee /tmp/install.log
+          rc=$?
+          echo "install.sh pipeline exit code: $rc"
+          echo "── install.log full tail ──"
+          tail -30 /tmp/install.log
+          # Key milestones must appear in the output, so the script cannot silently degrade
+          grep -q "PostgreSQL ready" /tmp/install.log
+          grep -q "SHA256 verified" /tmp/install.log
+          grep -q "database pojun ready" /tmp/install.log
+          grep -q "launchd service registered" /tmp/install.log
+          grep -q "service ready" /tmp/install.log || {
+            echo "── milestone 'service ready' grep failed, dumping bytes ──"
+            locale
+            echo "needle hex: $(printf '%s' "service ready" | od -An -tx1 | tr -d ' \n')"
+            echo "log tail bytes:"
+            tail -c 600 /tmp/install.log | od -c | tail -25
+            echo "grep -c: $(grep -c "service ready" /tmp/install.log || true)"
+            exit 1
+          }
+
+      - name: Verify service (launchd / health / database)
+        run: |
+          set -e
+          # The launchd service is running
+          launchctl print "gui/$(id -u)/com.pojun" | grep -q "state = running" \
+            || launchctl print "gui/$(id -u)/com.pojun" | grep -E "pid = [0-9]+"
+          # Health check
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/api/health)
+          [ "$code" = "200" ] || { echo "health=$code"; tail -50 ~/pojun/pojun.launchd.log; exit 1; }
+          echo "health 200 OK"
+          # Database role and database (psql defaults to a database named after the user; the runner user has no such database)
+          PGBIN="$(brew --prefix)/opt/postgresql@16/bin"
+          "$PGBIN/psql" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='pojun'" | grep -q 1
+          "$PGBIN/psql" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='pojun'" | grep -q 1
+          # config.json permissions
+          [ "$(stat -f '%Lp' ~/pojun/config.json)" = "600" ]
+
+      - name: Verify idempotent re-run (upgrade path)
+        run: |
+          # A second run = in-place upgrade: config.json / the database must be preserved verbatim
+          md5_before=$(md5 -q ~/pojun/config.json)
+          bash install.sh --mode=binary -y --version="$POJUN_SMOKE_VERSION" >/tmp/reinstall.log 2>&1
+          grep -q "reusing existing config.json" /tmp/reinstall.log
+          md5_after=$(md5 -q ~/pojun/config.json)
+          [ "$md5_before" = "$md5_after" ] || { echo "config.json was overwritten!"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/api/health)
+          [ "$code" = "200" ] || { echo "reinstall health=$code"; exit 1; }
+          echo "idempotent re-run OK (health 200, config preserved)"
+
+      - name: Verify KeepAlive (kill process, launchd revives)
+        run: |
+          # KeepAlive semantics: kill the pojun process; launchd + start.sh should bring it back
+          pkill -x pojun || true
+          sleep 15
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8787/api/health)
+          [ "$code" = "200" ] || { echo "after kill health=$code"; exit 1; }
+          echo "KeepAlive revive OK"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "── install.log tail ──"
+          tail -20 /tmp/install.log 2>/dev/null || true
+          echo "── launchd log tail ──"
+          tail -20 ~/pojun/pojun.launchd.log 2>/dev/null || true

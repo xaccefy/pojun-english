@@ -1,0 +1,225 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # required to create the Release
+  packages: write # required to push images to GHCR
+
+jobs:
+  # (1) Frontend static export (once); the artifact is reused by every cross-compiled platform
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:static
+        working-directory: web
+      - run: python3 scripts/strip_cjk.py web/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/out
+
+  # (2) Linux cross-compile (amd64/arm64, embedded frontend) + zip packaging.
+  #    Windows/macOS are not targeted yet: the product is positioned as a long-running Linux server deployment.
+  binaries:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/webui/dist
+      - name: Build and package with build.sh
+        env:
+          POJUN_TARGET_OS: ${{ matrix.goos }}
+          POJUN_TARGET_ARCH: ${{ matrix.goarch }}
+          POJUN_BUILD_VERSION: ${{ github.ref_name }}
+          POJUN_SKIP_FRONTEND: "1"
+          POJUN_SKIP_NPM_CI: "1"
+          # UPX self-extracting ELF binaries crash under some Linux kernels, virtualization setups and security policies.
+          # Releases rely on Go linker trimming and zip compression, prioritizing portability.
+          POJUN_COMPRESS: "0"
+          POJUN_PACKAGE: "1"
+          POJUN_PACKAGE_DIR: dist
+        run: |
+          ./build.sh --target "${POJUN_TARGET_OS}/${POJUN_TARGET_ARCH}"
+      - name: Smoke test Linux amd64 binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: dist/pojun-linux-amd64/pojun -h
+      # darwin artifacts cannot execute on an ubuntu runner, so verify the Mach-O format and that the frontend is embedded
+      - name: Verify darwin binary format
+        if: startsWith(matrix.goos, 'darwin')
+        run: |
+          file "dist/pojun-${{ matrix.goos }}-${{ matrix.goarch }}/pojun"
+          file "dist/pojun-${{ matrix.goos }}-${{ matrix.goarch }}/pojun" | grep -q "Mach-O"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "dist/*.zip"
+      # Raw Linux binaries are uploaded separately for the docker job to reuse (no need to rebuild frontend+Go inside the image)
+      - if: matrix.goos == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux-${{ matrix.goarch }}
+          path: |
+            dist/pojun-linux-${{ matrix.goarch }}/pojun
+            dist/pojun-linux-${{ matrix.goarch }}/pojun-hostd
+
+  # (3) Collect all zips -> create the GitHub Release
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      # This job only gets the dist/ artifacts and has no workspace; install.sh must come from the repo, so a checkout is required.
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.zip > SHA256SUMS
+      # install.sh is published as a Release asset too: the README-recommended
+      # `curl -fsSL .../releases/latest/download/install.sh | sudo bash` pulls it from here.
+      - name: Stage install.sh
+        run: cp install.sh dist/install.sh
+      # Release notes = install guide + the CHANGELOG section for this version (no generate_release_notes --
+      # the auto-generated "Full Changelog: vx...vy" link tells users nothing; details belong directly on the page).
+      - name: Build release notes (install guide + CHANGELOG section)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          {
+            echo "## Download and install"
+            echo ""
+            echo "**Linux / macOS** (amd64 + arm64, one command installs everything):"
+            echo ""
+            echo '```bash'
+            echo 'curl -fsSL https://github.com/chu0119/Pojun/releases/latest/download/install.sh | sudo bash'
+            echo '```'
+            echo ""
+            echo "**Windows**: use Docker Desktop (WSL2 backend); see the README \"Quick start\"."
+            echo "**Upgrade**: existing deployments use the page's \"one-click update\", or swap in place with this page's platform zip + SHA256SUMS."
+            echo "**Image**: \`ghcr.io/chu0119/pojun:$GITHUB_REF_NAME\` (amd64/arm64; the Docker form ships the toolchain inside the image)."
+            echo ""
+            echo "For detailed install/config/preset instructions see the README and docs/deployment-manual.md."
+            echo ""
+            echo "## What changed in this version"
+            echo ""
+            # Extract this version's full section from CHANGELOG.md (from ## [VER] to the next ##)
+            awk -v ver="## [$VER]" '
+              $0 ~ ver { flag = 1; next }
+              flag && /^## / { exit }
+              flag { print }
+            ' CHANGELOG.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "Full version-by-version history in [CHANGELOG.md](https://github.com/chu0119/Pojun/blob/main/CHANGELOG.md)."
+          } > /tmp/release-notes.md
+          head -30 /tmp/release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/install.sh
+          body_path: /tmp/release-notes.md
+
+  # (4) Multi-arch image (reuses the Linux binaries built by `binaries`; the image only installs tools + drops in the binaries;
+  #    arm64 only needs emulation for the apt layer, so builds are much faster).
+  #    Always published to GHCR (ghcr.io/chu0119/pojun) -- using the built-in Actions GITHUB_TOKEN,
+  #    so no secrets need configuring; if DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+  #    secrets are additionally configured, it also pushes to <DockerHub username>/pojun for users used to Docker Hub.
+  docker-cred-check:
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+    steps:
+      - id: check
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets not configured, skipping the Docker Hub image publish (the GHCR publish is unaffected)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  docker:
+    needs: [binaries, docker-cred-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5 # fetch the Dockerfile and skills/
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-amd64
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-arm64
+          path: dist/arm64
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # GHCR login: the built-in GITHUB_TOKEN suffices for a public repo, no configuration needed
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker Hub login: only runs when the secrets are configured
+      - uses: docker/login-action@v3
+        if: needs.docker-cred-check.outputs.ok == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Assemble the image name list
+        id: images
+        env:
+          DOCKERHUB_OK: ${{ needs.docker-cred-check.outputs.ok }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          imgs="ghcr.io/chu0119/pojun"
+          if [ "$DOCKERHUB_OK" = "true" ] && [ -n "$DOCKERHUB_USERNAME" ]; then
+            imgs="$imgs,${DOCKERHUB_USERNAME}/pojun"
+          fi
+          echo "images=$imgs" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.images.outputs.images }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

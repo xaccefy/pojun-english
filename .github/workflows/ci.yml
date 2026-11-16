@@ -1,0 +1,67 @@
+# CI gate: build + static checks + full test suite (needs PostgreSQL; test infrastructure in db/testmain_test.go)
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pojun
+          POSTGRES_PASSWORD: pojuntest
+          POSTGRES_DB: pojun_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pojun"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      POJUN_PG_DSN: postgres://pojun:pojuntest@localhost:5432/pojun_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        # -p 1: the packages that talk to PG are not only db/agent/server, the three that hold
+        # cross-package advisory locks (llmrec/evidence/traffic etc. take none); with multi-core parallelism
+        # on CI they deadlock against the agent package's write transactions
+        # (SQLSTATE 40P01, reproduced reliably twice). Running packages serially matches the TestMain lock design intent.
+        run: go test -p 1 ./... -count=1
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: web
+      # lint stays out of the gate for now: the 75 existing errors all need behavioural fixes (handling in
+      # empty catch blocks, awaiting floating Promises, a11y), which conflicts with the minimal-diff principle;
+      # left as a separate governance task. build:static already covers TS type checking and static-export verification.
+      - name: Build (static export)
+        run: npm run build:static
+        working-directory: web
+      - name: Normalise assets to English-only (third-party bundles ship CJK lookup tables)
+        run: python3 scripts/strip_cjk.py web/out
