@@ -441,7 +441,12 @@ WHERE id=$1`, nodeID, severity, appendix); err != nil {
 		return err
 	}
 	for _, asset := range assets {
-		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, nodeID, asset); err != nil {
+		// Model-supplied asset ids may dangle (guessed id, or the asset was
+		// deleted between list_assets and the write) — the FK would abort the
+		// whole merge. Same policy as AddNode/existingAssetIDs: skip the edge,
+		// keep the finding.
+		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id)
+SELECT $1, id FROM assets WHERE id=$2 ON CONFLICT DO NOTHING`, nodeID, asset); err != nil {
 			return err
 		}
 	}
