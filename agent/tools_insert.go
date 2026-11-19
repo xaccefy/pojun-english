@@ -799,7 +799,7 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// auth_request: assemble an authenticated request using credentials registered on the asset (prerequisite for lateral/privesc verification).
 		t.authRequest(),
 		t.httpRequest(), t.sessionLogin(),
-		t.diffResponses(), t.diffResponses(),
+		t.diffResponses(),
 		// api_contract: read the API contract files a target exposes — a more precise endpoint list than crawling.
 		t.apiContractTool(),
 		// search_recent_critical: query recently disclosed critical vulns by [time] (no need to know the component/CVE first).

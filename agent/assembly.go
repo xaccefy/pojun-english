@@ -85,6 +85,23 @@ var localExecToolNames = map[string]bool{
 	"Edit":         true,
 	"MultiEdit":    true,
 	"NotebookEdit": true,
+	// Domain tools with host/target side effects — without these a local_exec=false
+	// agent that has them bound can still run commands, write files or act on the
+	// target, defeating the flag's 'orchestrate, don't execute' contract.
+	"job_start":        true,
+	"job_stop":         true,
+	"run_script":       true,
+	"save_script":      true,
+	"save_evidence":    true,
+	"poc_scaffold":     true,
+	"http_request":     true,
+	"session_login":    true,
+	"http_probe":       true,
+	"auth_request":     true,
+	"js_audit":         true,
+	"scan_with_nuclei": true,
+	"listener_start":   true,
+	"listener_stop":    true,
 }
 
 // DropLocalExecTools returns tools minus the local-execution ones, for agents whose

@@ -299,6 +299,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV5(); err != nil {
 		return fmt.Errorf("seed intercept rules v5: %w", err)
 	}
+	if err := d.seedInterceptToolCoverageV6(); err != nil {
+		return fmt.Errorf("seed intercept tool coverage v6: %w", err)
+	}
 	if err := d.migrateListenerRuleTimeout(); err != nil {
 		return fmt.Errorf("migrate listener rule timeout: %w", err)
 	}
@@ -517,6 +520,53 @@ ON CONFLICT DO NOTHING`,
 		}
 	}
 	return nil
+}
+
+// seedInterceptToolCoverageV6 merges the v6 coverage additions into a persisted
+// enabled-tools list (the same one-shot append as V4/V5 — instances that never
+// saved a list pick them up through the code defaults). These are the
+// side-effect/exec/network tools that used to silently bypass interception:
+// job_start (Bash-equivalent exec), script/evidence writes, target/network tools,
+// the mcp__* prefix wildcard, and every already-enabled non-shell custom tool
+// (their keys are user-chosen so they can't ride the code defaults — creation
+// now merges them, this backfills the pre-existing ones). One-shot, flag-guarded
+// like the rule batches.
+func (d *DB) seedInterceptToolCoverageV6() error {
+	const flag = "intercept_enabled_tools_v6"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	additions := []string{
+		"job_start", "job_stop",
+		"run_script", "save_script", "save_evidence", "poc_scaffold",
+		"http_request", "session_login", "http_probe", "auth_request",
+		"js_audit", "scan_with_nuclei", "NotebookEdit", "mcp__*",
+	}
+	if customs, err := d.ListCustomTools(); err == nil {
+		for _, ct := range customs {
+			if ct.Enabled && ct.Kind != "shell" {
+				additions = append(additions, ct.Key)
+			}
+		}
+	}
+	if raw, ok, err := d.GetSetting("intercept_enabled_tools"); err != nil {
+		return err
+	} else if ok {
+		if merged, changed := mergeEnabledInterceptTools(raw, additions...); changed {
+			if err := d.SetSetting("intercept_enabled_tools", merged); err != nil {
+				return err
+			}
+		}
+	}
+	return d.SetSetting(flag, "done")
+}
+
+// MergeEnabledInterceptTools is the exported form of the append-only merge:
+// callers that can't reach mergeEnabledInterceptTools (e.g. the server wiring a
+// new custom tool into interception) use it. It does NOT write — returns the
+// merged JSON so the caller decides when/if to persist.
+func (d *DB) MergeEnabledInterceptTools(raw string, additions ...string) (string, bool) {
+	return mergeEnabledInterceptTools(raw, additions...)
 }
 
 // mergeEnabledInterceptTools appends newly introduced tools to a persisted

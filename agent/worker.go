@@ -382,7 +382,7 @@ func renderIntentTask(intent *db.Node) string {
 // premiseCheckHint is the 'premise re-check' hard reminder: an intent is a snapshot from planning time — the target may have
 // been disproven while it queued (production: an intent ran 3 hours on a dead target). Re-check against the latest facts
 // before starting; if invalidated, write a fact and wrap — don't force-run.
-const premiseCheckHint = "\n\n[Re-check the premise before executing (important)]: before starting, use list_facts / graph_overview to verify your intent's hypothesis and target still hold. " +
+const premiseCheckHint = "\n\n[Re-check the premise before executing (important)]: before starting, use list_findings / search_all_worker_traces to verify your intent's hypothesis and target still hold. " +
 	"If the latest facts clearly negate it (the target proved dead, the real entry was located elsewhere, the direction was ruled out by conclusions), don't force-run: " +
 	"record_fact an 'intent premise invalidated: reason + supporting fact id' and end — hand the direction back to the planner for re-dispatch."
 

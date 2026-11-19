@@ -56,6 +56,17 @@ func hasMechanicalVerification(evidence string) bool {
 		"status: 200", "status: 403", "status: 301", "status: 302", // status codes
 		"\"code\":", "\"status\":",              // JSON response fields
 		"location:", "set-cookie:", "content-type:", // HTTP response header fields
+		// Non-HTTP mechanical credentials: command-exec, auth and service-probe
+		// outputs. A redis/hydra/ssh/RCE finding carries none of the web tokens
+		// above — without these, critical/high non-HTTP vulns can never pass the
+		// mechanical gate and get force-downgraded to medium.
+		"uid=", "gid=", "root:", "nt authority\\", // id/whoami, /etc/passwd, windows whoami output
+		"hydra", "ncrack", "medusa",               // credential-attack tool output
+		"masscan", "nmap", "naabu",                // port/banner scan output
+		"redis-cli", "smbclient", "rpcclient",     // service client output
+		"impacket", "crackmapexec", "netexec", "meterpreter", // lateral/shell output
+		"+ok",                                     // redis-cli/mc-style service proof
+		"password:", "login:",                     // interactive auth transcripts
 	}
 	for _, sig := range signals {
 		if strings.Contains(lower, sig) {

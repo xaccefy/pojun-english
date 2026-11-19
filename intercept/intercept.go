@@ -141,12 +141,13 @@ type Reviewer func(ctx context.Context, profileID int64, prompt string, input Re
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
 type Interceptor struct {
-	db           *db.DB
-	mu           sync.RWMutex
-	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
-	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	db              *db.DB
+	mu              sync.RWMutex
+	cached          []compiledRule  // sorted by priority DESC; nil means not loaded yet
+	enabledTools    map[string]bool // nil means not loaded yet
+	enabledPrefixes []string        // '*' suffix entries → prefix match (e.g. mcp__*)
+	pending         *pendingManager
+	reviewer        Reviewer // nil = LLM fallback judge not wired
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -161,12 +162,36 @@ func (i *Interceptor) SetReviewer(r Reviewer) {
 // goal_met ends the whole task in one sentence without going through prove_goal's
 // evidence chain (v0.3.88 audit S3) — once in the set it can be matched by rules (the
 // built-in judge rule 'goal_met wrap-up review' ships in the V5 seed batch).
+// Every tool with host/target side effects belongs here — a tool missing from
+// this set silently bypasses BOTH rule matching and the fallback judge
+// (guard.applyIntercept returns early on IsToolEnabled=false). Entries ending
+// in '*' match by prefix, covering dynamically named families like mcp__<srv>__<tool>.
 var defaultEnabledTools = []string{
 	"Bash", "WebFetch", "web_search",
 	"shell_open", "shell_send",
 	"listener_start", "listener_stop",
 	"goal_met",
 	"Write", "Edit", "MultiEdit",
+	"NotebookEdit",
+	// Background jobs: job_start is equivalent to Bash (execs arbitrary commands)
+	// — it must face the same destructive/exfil rules.
+	"job_start", "job_stop",
+	// Script/evidence file writes and script execution.
+	"run_script", "save_script", "save_evidence", "poc_scaffold",
+	// Tools that act on the target or the network: exfil-shaped deny/ask rules
+	// must reach them, not only Bash.
+	"http_request", "session_login", "http_probe", "auth_request",
+	"js_audit", "scan_with_nuclei",
+	// MCP tools are named dynamically (mcp__<server>__<tool>) — prefix wildcard.
+	"mcp__*",
+}
+
+// DefaultEnabledTools returns the shipped intercept tool set (copy — callers may
+// append their own tool names when materializing a persisted list).
+func DefaultEnabledTools() []string {
+	out := make([]string, len(defaultEnabledTools))
+	copy(out, defaultEnabledTools)
+	return out
 }
 
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
@@ -182,6 +207,7 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.enabledPrefixes = nil
 	i.mu.Unlock()
 }
 
@@ -230,11 +256,7 @@ func (i *Interceptor) loadLocked() error {
 		if i.cached == nil {
 			i.cached = []compiledRule{}
 		}
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
+		i.enabledTools, i.enabledPrefixes = splitEnabledTools(defaultEnabledTools)
 		return nil
 	}
 	rules, err := i.db.ListInterceptRules()
@@ -261,24 +283,33 @@ func (i *Interceptor) loadLocked() error {
 	// Load enabled-tools set from settings, falling back to hard-coded defaults.
 	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
 	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
+		i.enabledTools, i.enabledPrefixes = splitEnabledTools(defaultEnabledTools)
 	} else {
 		var names []string
 		if json.Unmarshal([]byte(val), &names) != nil {
 			i.enabledTools = map[string]bool{}
+			i.enabledPrefixes = nil
 		} else {
-			m := make(map[string]bool, len(names))
-			for _, n := range names {
-				m[n] = true
-			}
-			i.enabledTools = m
+			i.enabledTools, i.enabledPrefixes = splitEnabledTools(names)
 		}
 	}
 	return nil
+}
+
+// splitEnabledTools separates exact names from '*' suffix wildcard entries
+// (prefix match — covers dynamically named tool families like mcp__<srv>__<tool>
+// which can't be enumerated statically).
+func splitEnabledTools(names []string) (map[string]bool, []string) {
+	m := make(map[string]bool, len(names))
+	var prefixes []string
+	for _, n := range names {
+		if strings.HasSuffix(n, "*") {
+			prefixes = append(prefixes, n[:len(n)-1])
+			continue
+		}
+		m[n] = true
+	}
+	return m, prefixes
 }
 
 func (i *Interceptor) rules() ([]compiledRule, error) {
@@ -303,11 +334,19 @@ func (i *Interceptor) rules() ([]compiledRule, error) {
 
 // IsToolEnabled returns true if the named tool is in the intercept-enabled set
 // (i.e. it should enter the rule-matching path). Uses the same double-check lock
-// pattern as rules().
+// pattern as rules(). A '*' suffix entry in the set matches by prefix.
 func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.RLock()
 	if i.enabledTools != nil {
 		v := i.enabledTools[name]
+		if !v {
+			for _, p := range i.enabledPrefixes {
+				if strings.HasPrefix(name, p) {
+					v = true
+					break
+				}
+			}
+		}
 		i.mu.RUnlock()
 		return v
 	}
@@ -318,7 +357,15 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	if i.enabledTools == nil {
 		_ = i.loadLocked()
 	}
-	return i.enabledTools[name]
+	if i.enabledTools[name] {
+		return true
+	}
+	for _, p := range i.enabledPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetEnabledTools returns the ordered list of tool names that are currently

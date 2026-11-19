@@ -20,6 +20,7 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/intercept"
 )
 
 // This file implements the custom-tool executor (docs/Custom Tool Design.md). tools rows
@@ -78,6 +79,9 @@ func (s *Server) pgCreateCustomTool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if req.Kind != "shell" {
+		s.ensureInterceptToolEnabled(req.Key)
+	}
 	writeJSON(w, 200, map[string]any{"key": req.Key})
 }
 
@@ -115,6 +119,9 @@ func (s *Server) pgUpdateCustomTool(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if req.Kind != "shell" {
+		s.ensureInterceptToolEnabled(key)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -210,8 +217,11 @@ func (s *Server) seedPythonInterpreter() {
 		return
 	}
 	if p := detectPython(); p != "" {
-		_ = s.m.pg.SetSetting(settingPythonInterp, p)
-		log.Printf("[custom-tool] auto-detected python interpreter: %s", p)
+		if err := s.m.pg.SetSetting(settingPythonInterp, p); err != nil {
+			log.Printf("[custom-tool] detected python interpreter %s but failed to persist: %v (will re-detect per call)", p, err)
+		} else {
+			log.Printf("[custom-tool] auto-detected python interpreter: %s", p)
+		}
 	}
 }
 
@@ -340,6 +350,12 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 	// reuse the same underlying run Bash uses (via Bash CoreTool.Call): inherits the
 	// safety floor / timeouts / proxy env / output overflow for free. The tool sits
 	// beside Bash sharing the substrate — the model doesn't go through Bash.
+	// Interception: the PreToolUse hook sees this call under the custom tool's own
+	// name+params — deny/ask rules on the *rendered command* (rm -rf, exfil pipes)
+	// would never see the actual shell text, so evaluate it here as Bash too.
+	if msg := s.evalInterceptForCustomCommand(ctx, cmd); msg != "" {
+		return actool.Errorf(msg), nil
+	}
 	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
 	if spec.TimeoutMs > 0 {
 		var cancel context.CancelFunc
@@ -531,4 +547,91 @@ func scalarStr(v any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// ---------- interception wiring ----------
+
+// ensureInterceptToolEnabled merges names into the intercept-enabled set so the
+// new custom tool's calls face rule matching + judge. A command/script/http
+// custom tool that never enters interception is a silent bypass — creation is
+// the right moment to wire it in. With no persisted list the code defaults are
+// materialized first so the resulting set stays complete rather than holding
+// only the new key. Best-effort: a failed merge logs and continues (the tool
+// still works; an operator can add the key manually in tool-config).
+func (s *Server) ensureInterceptToolEnabled(names ...string) {
+	pg := s.m.pg
+	if pg == nil {
+		return
+	}
+	raw, ok, err := pg.GetSetting("intercept_enabled_tools")
+	if err != nil {
+		log.Printf("[custom-tool] enabled-tools read failed: %v", err)
+		return
+	}
+	if !ok {
+		b, _ := json.Marshal(intercept.DefaultEnabledTools())
+		raw = string(b)
+	}
+	merged, changed := pg.MergeEnabledInterceptTools(raw, names...)
+	if !changed {
+		return
+	}
+	if err := pg.SetSetting("intercept_enabled_tools", merged); err != nil {
+		log.Printf("[custom-tool] enabled-tools persist failed: %v", err)
+		return
+	}
+	s.m.interceptor.Invalidate()
+}
+
+// evalInterceptForCustomCommand runs the rendered command through interception
+// under the "Bash" name. A command-kind custom tool reaches the PreToolUse hook
+// under its own key+params — deny/ask rules on command *content* (rm -rf, exfil
+// pipes, destructive ops) would never see the actual shell text, so the rendered
+// command is evaluated here exactly as a real Bash call would be. Honors the
+// operator's tool-config: if Bash interception is disabled, evaluation is
+// skipped. Returns "" to proceed, or the block message to surface as a tool
+// error. Mirrors guard.applyIntercept's decision flow.
+func (s *Server) evalInterceptForCustomCommand(ctx context.Context, cmd string) string {
+	ic := s.m.interceptor
+	if ic == nil || !ic.IsToolEnabled("Bash") {
+		return ""
+	}
+	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
+	ctx = intercept.WithCall(ctx, "Bash", bashIn)
+	dec, matched := ic.Match("Bash", bashIn)
+	if !matched {
+		d, judged := ic.Judge(ctx, "Bash", bashIn)
+		if !judged {
+			return ""
+		}
+		dec = d
+	} else if dec.Action == "judge" {
+		ruleID := dec.RuleID
+		rt := intercept.RuleTimeout{}
+		if dec.TimeoutEnabled {
+			rt = intercept.RuleTimeout{Enabled: true, Seconds: dec.TimeoutSeconds, Action: dec.TimeoutAction}
+		}
+		d, judged := ic.JudgeRuleWithTimeout(ctx, "Bash", bashIn, rt)
+		if !judged {
+			return ""
+		}
+		d.RuleID = ruleID
+		dec = d
+	}
+	switch dec.Action {
+	case "deny":
+		ic.Log(ctx, intercept.ConvIDFromContext(ctx), dec, "Bash", bashIn, "denied")
+		return "[POJUN PLATFORM CONTROL·NOT TARGET DEFENSE] This call was blocked by the platform. Reason: " + dec.Message + ". This operation is forbidden."
+	case "allow":
+		ic.Log(ctx, intercept.ConvIDFromContext(ctx), dec, "Bash", bashIn, "allowed")
+		return ""
+	case "ask":
+		if ctx.Err() != nil {
+			return "[POJUN PLATFORM CONTROL·NOT TARGET DEFENSE] Work cancelled, platform security controls blocked execution"
+		}
+		if !ic.HandleAsk(ctx, intercept.ConvIDFromContext(ctx), dec, "Bash", bashIn) {
+			return "[POJUN PLATFORM CONTROL·NOT TARGET DEFENSE] Manual approval not granted (user rejected or approval timed out)"
+		}
+	}
+	return ""
 }

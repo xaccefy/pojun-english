@@ -651,7 +651,11 @@ func (s *Server) scanTaskArtifactDir(taskID string) (added, skipped, truncated i
 // registrations (v0.4.10).
 // POST /api/tasks/{id}/artifacts/scan
 func (s *Server) scanTaskArtifacts(w http.ResponseWriter, r *http.Request) {
-	taskID := r.PathValue("id")
+	taskID, ok := canonicalTaskID(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 400, "bad task id")
+		return
+	}
 	added, skipped, truncated, err := s.scanTaskArtifactDir(taskID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
