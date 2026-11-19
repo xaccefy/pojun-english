@@ -44,7 +44,7 @@ services:
       # Reverse-connection port mapping (open as needed): ports that MSF/listener
       # inside the container listens on must be mapped to the host for the agent
       # to receive a reverse shell. Example (uncomment and adjust as needed):
-      # - "4444-4450:4444-4450"
+      - "4444-4450:4444-4450"
     volumes:
       # Bind the data directory (jwt.key, SQLite, etc.) to data/ at the project
       # root: easy to inspect/back up from the host, and survives container
@@ -54,6 +54,14 @@ services:
       # the /app/skills baked into the image); skill edits need no image rebuild,
       # the container reads the host copy.
       - ./skills:/app/skills
+      # Persist the JWT signing key: it lives at /app/jwt.key (outside the data
+      # dir by design — the file manager must never serve it). Without a bind
+      # mount, recreating the container rotates the key and invalidates sessions.
+      # The host file MUST exist before `up` — Docker creates a directory for
+      # missing bind sources, which breaks startup. Enable with:
+      #   touch jwt.key && chmod 600 jwt.key
+      # then uncomment:
+      # - ./jwt.key:/app/jwt.key
     restart: unless-stopped
 
 volumes:
