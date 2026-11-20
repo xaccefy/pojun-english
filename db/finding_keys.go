@@ -33,16 +33,19 @@ type FindingKey struct {
 	Kind string `json:"kind"`
 }
 
+// strongFindingKeyRank 返回身份键的强度排名：数值越小越强，99 表示弱键。
+//
+// 身份必须来自语义，位置不能当身份。endpoint / param 描述的是「在哪儿」——
+// 同一 host+path 天然可以承载 IDOR、认证绕过、参数注入、SSRF 等多个互不相同的
+// 漏洞；把它们当强键等于断言「同一位置就是同一漏洞」，会让不同漏洞被物理合并
+// 进同一 findings 行，各自的报告随后互相覆盖。二者仍会生成（供重复提示与审计），
+// 但只算弱键，不参与自动合并。
 func strongFindingKeyRank(kind string) int {
 	switch kind {
 	case FindingKeyRoot:
 		return 1
 	case FindingKeyCVE:
 		return 2
-	case FindingKeyParam:
-		return 3
-	case FindingKeyEndpoint:
-		return 4
 	case FindingKeyLegacy:
 		return 5
 	}
@@ -72,7 +75,22 @@ func normalizeRootCauseKey(raw string) string {
 	if len(out) > 96 {
 		out = out[:96]
 	}
+	// 过短或只是通用词的不构成根因标识：它们会把无关漏洞并到一起。
+	// 根因键是「显式声明同一根因」的手段，宁缺毋滥——传了无效值等于没传。
+	if len(out) < 4 || genericRootCauseKeys[out] {
+		return ""
+	}
 	return out
+}
+
+// genericRootCauseKeys are generic words shared by many unrelated findings — they can't serve as a root-cause key.
+var genericRootCauseKeys = map[string]bool{
+	"vuln": true, "vulns": true, "vulnerability": true, "bug": true, "issue": true,
+	"xss": true, "sqli": true, "ssrf": true, "idor": true, "rce": true, "csrf": true,
+	"injection": true, "inject": true, "auth": true, "authn": true, "authz": true,
+	"auth-bypass": true, "info-leak": true, "infoleak": true, "info-disclosure": true,
+	"generic": true, "default": true, "unknown": true, "other": true, "misc": true,
+	"none": true, "null": true, "test": true, "tmp": true, "todo": true,
 }
 
 // normalizeFindingEndpoint normalizes a URL or path to host+path (lowercase host, drop query/hash,
@@ -83,14 +101,19 @@ func normalizeFindingEndpoint(raw string) string {
 		return ""
 	}
 	if strings.Contains(s, "://") {
-		if u, err := url.Parse(s); err == nil && u.Host != "" {
-			host := strings.ToLower(u.Host)
-			path := strings.TrimRight(u.EscapedPath(), "/")
-			if path == "" {
-				path = "/"
-			}
-			return host + path
+		u, err := url.Parse(s)
+		if err != nil || u.Host == "" {
+			// fail-closed：无法解析的「URL」不构成身份。此前这里会回退成原文
+			// 小写，于是被标点连带的片段（如「http://host（说明文字」）会成为
+			// 垃圾键，让分组结果随文案措辞漂移。
+			return ""
 		}
+		host := strings.ToLower(u.Host)
+		path := strings.TrimRight(u.EscapedPath(), "/")
+		if path == "" {
+			path = "/"
+		}
+		return host + path
 	}
 	if i := strings.IndexAny(s, "?#"); i >= 0 {
 		s = s[:i]
@@ -100,6 +123,12 @@ func normalizeFindingEndpoint(raw string) string {
 		s = "/"
 	}
 	return strings.ToLower(s)
+}
+
+// findingEndpointIsRoot reports whether the normalized endpoint is just the asset base (no concrete path).
+// normalizeFindingEndpoint strips the trailing slash from non-root paths, so only a root path ends in "/".
+func findingEndpointIsRoot(endpoint string) bool {
+	return strings.HasSuffix(endpoint, "/")
 }
 
 // firstFindingURL takes the first http(s) URL from name/summary/evidence as the endpoint key source.
@@ -135,12 +164,14 @@ func FindingDedupKeys(in RecordFindingInput, fp string) []FindingKey {
 	for _, cve := range findingCVERe.FindAllString(text, -1) {
 		add(FindingKeyCVE, "cve:"+strings.ToUpper(cve))
 	}
+	// 端点键只在路径非根时生成：裸资产基址（host + "/"）不构成端点身份，
+	// 否则同一资产上的所有漏洞都会落到同一个 endpoint:<host>/ 键上。
 	endpoint := normalizeFindingEndpoint(firstFindingURL(in))
-	if endpoint != "" {
+	if endpoint != "" && !findingEndpointIsRoot(endpoint) {
 		add(FindingKeyEndpoint, "endpoint:"+endpoint)
-	}
-	if param := strings.ToLower(strings.TrimSpace(in.Parameter)); param != "" && endpoint != "" {
-		add(FindingKeyParam, "param:"+endpoint+":"+param)
+		if param := strings.ToLower(strings.TrimSpace(in.Parameter)); param != "" {
+			add(FindingKeyParam, "param:"+endpoint+":"+param)
+		}
 	}
 	if fp != "" {
 		add(FindingKeyLegacy, "legacy:"+fp)
@@ -286,6 +317,7 @@ ORDER BY id LIMIT 1 FOR UPDATE`, in.TaskID, fp).Scan(&id)
 FROM finding_keys fk
 JOIN findings f ON f.id=fk.finding_id
 WHERE f.task_id=$1 AND f.status IN ('pending','in_progress','confirmed')
+  AND fk.kind NOT IN ('endpoint','param')
   AND fk.dedup_key IN (` + strings.Join(ph, ",") + `)
 GROUP BY f.id, f.created_at
 ORDER BY prio, f.created_at, f.id
@@ -591,7 +623,8 @@ ON CONFLICT (finding_id,dedup_key) DO NOTHING`, targetID, srcID); err != nil {
 func weakFindingCandidatesTx(tx *sql.Tx, findingID int64, keys []FindingKey) []int64 {
 	var weak []string
 	for _, k := range keys {
-		if k.Kind == FindingKeyName || k.Kind == FindingKeyAssetClass {
+		switch k.Kind {
+		case FindingKeyName, FindingKeyAssetClass, FindingKeyEndpoint, FindingKeyParam:
 			weak = append(weak, k.Key)
 		}
 	}
@@ -608,7 +641,7 @@ func weakFindingCandidatesTx(tx *sql.Tx, findingID int64, keys []FindingKey) []i
 FROM finding_keys fk1
 JOIN finding_keys fk2 ON fk2.dedup_key=fk1.dedup_key AND fk2.finding_id<>fk1.finding_id
 JOIN findings f ON f.id=fk2.finding_id
-WHERE fk1.finding_id=$1 AND fk1.kind IN ('name','asset_class')
+WHERE fk1.finding_id=$1 AND fk1.kind IN ('name','asset_class','endpoint','param')
   AND fk1.dedup_key IN (`+strings.Join(ph, ",")+`)
   AND f.status IN ('pending','in_progress','confirmed')
   AND f.task_id=(SELECT task_id FROM findings WHERE id=$1)
@@ -702,7 +735,7 @@ func (d *DB) FindingMergeCandidates(ctx context.Context, findingID int64) ([]*DB
 FROM finding_keys fk1
 JOIN finding_keys fk2 ON fk2.dedup_key=fk1.dedup_key AND fk2.finding_id<>fk1.finding_id
 JOIN findings f ON f.id=fk2.finding_id
-WHERE fk1.finding_id=$1 AND fk1.kind IN ('name','asset_class')
+WHERE fk1.finding_id=$1 AND fk1.kind IN ('name','asset_class','endpoint','param')
   AND f.status IN ('pending','in_progress','confirmed')
   AND f.task_id=(SELECT task_id FROM findings WHERE id=$1)
 LIMIT 20`, findingID)

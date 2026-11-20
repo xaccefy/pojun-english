@@ -97,7 +97,7 @@ func TestGitHubAssetURL(t *testing.T) {
 	if !ok {
 		t.Fatal("the catalog should contain nuclei")
 	}
-	u := GitHubAssetURL(nuclei, "v3.4.10")
+	u := GitHubAssetURL(nuclei, nuclei.AssetTmpl, "v3.4.10")
 	want := "https://github.com/projectdiscovery/nuclei/releases/download/v3.4.10/nuclei_3.4.10_linux_"
 	if !strings.HasPrefix(u, want) {
 		t.Errorf("wrong asset URL prefix: %s", u)
@@ -155,7 +155,7 @@ func TestAssetURLForProjectDiscoveryFamily(t *testing.T) {
 		if tool.Kind != hosttools.KindGitHub {
 			t.Errorf("%s kind should be github, got %q", id, tool.Kind)
 		}
-		u := GitHubAssetURL(tool, "v1.2.3")
+		u := GitHubAssetURL(tool, tool.AssetTmpl, "v1.2.3")
 		want := "https://github.com/projectdiscovery/" + id +
 			"/releases/download/v1.2.3/" + id + "_1.2.3_linux_"
 		if !strings.HasPrefix(u, want) {

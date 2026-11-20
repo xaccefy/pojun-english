@@ -2,11 +2,12 @@ package server
 
 import (
 	"context"
-	"path/filepath"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,6 +182,58 @@ type workExecution struct {
 	action string // user action: pause | cancel
 }
 
+// EngineTaskSnapshot is the engine runtime snapshot used by the diagnostics bundle (read-only, no DB reads, no requests).
+type EngineTaskSnapshot struct {
+	TaskID         string  `json:"task_id"`
+	WorkersTarget  int64   `json:"workers_target"`
+	Inflight       int64   `json:"inflight"`
+	PlannerRound   int     `json:"planner_round"`
+	RunningIntents []int64 `json:"running_intents"`
+	Settling       bool    `json:"settling"`
+	Paused         bool    `json:"paused"`
+	Deleting       bool    `json:"deleting"`
+	DeadlineUnix   int64   `json:"deadline_unix"`
+}
+
+// Snapshot returns the in-memory engine state of every started task. Lock order: take the task set
+// under runtimeMu first, then read each sync.Map — avoids long mutual exclusion against kill/steer.
+func (e *Engine) Snapshot() []EngineTaskSnapshot {
+	if e == nil {
+		return nil
+	}
+	ids := make([]string, 0, 16)
+	e.runtimeMu.Lock()
+	for id := range e.runtimes {
+		ids = append(ids, id)
+	}
+	e.runtimeMu.Unlock()
+	sort.Strings(ids)
+	out := make([]EngineTaskSnapshot, 0, len(ids))
+	for _, id := range ids {
+		s := EngineTaskSnapshot{TaskID: id}
+		if v, ok := e.inflight.Load(id); ok {
+			s.Inflight = atomic.LoadInt64(v.(*int64))
+		}
+		if v, ok := e.plannerRound.Load(id); ok {
+			s.PlannerRound, _ = v.(int)
+		}
+		if v, ok := e.settling.Load(id); ok {
+			s.Settling, _ = v.(bool)
+		}
+		if v, ok := e.paused.Load(id); ok {
+			s.Paused, _ = v.(bool)
+		}
+		if v, ok := e.deleting.Load(id); ok {
+			s.Deleting, _ = v.(bool)
+		}
+		if v, ok := e.deadline.Load(id); ok {
+			s.DeadlineUnix, _ = v.(int64)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // nextPlannerRound returns the next planner round number for a task (1-based).
 func (e *Engine) nextPlannerRound(taskID string) int {
 	v, _ := e.plannerRound.LoadOrStore(taskID, 0)
@@ -338,6 +391,10 @@ func (e *Engine) Resume(t *Task) {
 		return
 	}
 	e.paused.Delete(t.ID)
+	// The watchdog doesn't update lastProgressAt while paused; keeping the old value on resume would let
+	// the next tick count the pause as "no progress", immediately misfiring stall_nudge and advancing the
+	// deadline-extension counter. Resuming restarts the clock.
+	e.autoTrack.Delete(t.ID)
 	t.Notify()
 }
 
@@ -589,7 +646,9 @@ func transitionIntentState(store *db.ExplorationStore, intentID int64, expected,
 
 // retryIntentTerminalAsync backstops terminal-state write failures: auto-rewrite after a short DB fault —
 // keeps intents from parking at running forever (HasActiveIntent stays true, task can't wrap up, UI 409s).
-func (e *Engine) retryIntentTerminalAsync(store *db.ExplorationStore, intentID int64, state, stopReason string) {
+// onDone is called after a successful backfill (may be nil); it re-wakes the consumer of the wrap-up
+// predicate.
+func (e *Engine) retryIntentTerminalAsync(store *db.ExplorationStore, intentID int64, state, stopReason string, onDone func()) {
 	go func() {
 		for attempt := 0; attempt < 12; attempt++ {
 			time.Sleep(5 * time.Second)
@@ -599,6 +658,9 @@ func (e *Engine) retryIntentTerminalAsync(store *db.ExplorationStore, intentID i
 					_ = store.SetIntentStopReason(intentID, stopReason)
 				}
 				log.Printf("[worker] intent #%d terminal state %s backfilled in background", intentID, state)
+				if onDone != nil {
+					onDone()
+				}
 				return
 			}
 			if errors.Is(err, db.ErrIntentStateConflict) {
@@ -1173,6 +1235,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
 				// name reportless vulns before landing done (see warnFindingsWithoutReport).
 				e.warnFindingsWithoutReport(t)
+				// This path skips settleTaskWithReason and previously only had an activity entry, no
+				// process log — afterwards there was no telling why the task ended. Added one, aligned
+				// with the [settle] log.
+				log.Printf("[goalless] task %s all goals met and frontier drained, landing wrap-up as done", t.ID)
 				// frontier drained AND nothing running → wrap up. Use the Guarded variant for CAS — avoids racing
 				// concurrent pause/delete/timeout-wrap-up transitions.
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -1250,41 +1316,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return planner.Plan(ctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		})
 		e.EndLLMCall(t.ID)
-		switch {
-		case res.err != nil && roundCtx.Err() != nil && ectx.Err() == nil:
-			// Plan-round timeout (this round's own wall-clock cap — not the task deadline).
-			//
-			// This branch MUST stay reachable: on timeout the round is voided, runRound ends normally and the
-			// planner responds again — the next wake plans another round. It must NOT fall into the 'planning
-			// error' branch below and get swallowed silently — that would regress to 'permanently silent'.
-			log.Printf("[planner] task %s plan round timed out (%s) — round voided, retrying on next wake", t.ID, plannerRoundLimit())
-		case res.err != nil && ectx.Err() == nil:
-			log.Printf("[planner] task %s planning error: %v", t.ID, res.err)
-		case res.met:
-			// Autopilot refill: when all goals are met, first ask 'is there anything left'. Untested assets /
-			// high-sev vulns remaining AND waves unused → auto-append the next goal layer; this round doesn't
-			// cancel workers or settle — treat as 'unfinished' and keep planning.
-			if e.maybeExtendAutopilot(t) {
-				res.met = false
-				break
-			}
-			log.Printf("[planner] task %s judged goal met: %s", t.ID, res.reason)
-			// Task judged done → immediately cancel running workers: their in-flight intents' output is moot.
-			// Next worker loop hits the terminal gate and stops claiming; the cancelled batch lands in the
-			// 'task finished' branch below as stopped (not blocked).
-			e.cancelExec(t.ID, agent.AbortGoalMet)
-		default:
-			log.Printf("[planner] task %s planning done", t.ID)
-		}
-		// Auto-wrap-up decision (v0.5.0): only record the reason — the actual settle runs in plannerLoop after
-		// this round's inflight drains (avoids drain waiting on itself).
-		if res.err == nil && ectx.Err() == nil && !e.isSettling(t.ID) {
-			if res.met {
-				t.requestSettle("goal_met", "planner judged the goal achieved")
-			} else {
-				e.recordAndEvaluateAutoFinish(t, int64(round), triggers)
-			}
-		}
+		e.handlePlannerRoundOutcome(t, int64(round), triggers, res, roundCtx, ectx)
 		// Coverage-matrix / depth-gap nudge (v0.4.63): when prompt constraints can't hold weak models, the
 		// engine deterministically adds a layer. Doesn't require res.err==nil — timeouts/model faults nudge too.
 		if ectx.Err() == nil && !e.isSettling(t.ID) {
@@ -1312,6 +1344,58 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		// Re-arm the heartbeat after every wake (edge or heartbeat): any plan trigger restarts this idle timer.
 		resetPlannerTimer(heartbeat, interval)
+	}
+}
+
+// handlePlannerRoundOutcome handles one planning round's outcome: log the verdict → record the
+// wrap-up predicate → cancel running workers.
+//
+// The **order** here is part of the behavior: cancelExec cancels exactly this round's ectx (the
+// per-task ctx cached by execContextFor), so cancelling before checking ectx.Err() would make the
+// goal_met wrap-up predicate unreachable for this round — the record would never be set and the task
+// could only end by heartbeat/timeout. Extracted into a method so a unit test can pin the order
+// (engine_settle_test.go).
+func (e *Engine) handlePlannerRoundOutcome(t *Task, round int64, triggers []agent.TriggerEvent, res plannerRoundOutcome, roundCtx, ectx context.Context) {
+	switch {
+	case res.err != nil && roundCtx.Err() != nil && ectx.Err() == nil:
+		// Plan-round timeout (this round's own wall-clock cap — not the task deadline).
+		//
+		// This branch MUST stay reachable: on timeout the round is voided, runRound ends normally and the
+		// planner responds again — the next wake plans another round. It must NOT fall into the 'planning
+		// error' branch below and get swallowed silently — that would regress to 'permanently silent'.
+		log.Printf("[planner] task %s plan round timed out (%s) — round voided, retrying on next wake", t.ID, plannerRoundLimit())
+	case res.err != nil && ectx.Err() == nil:
+		log.Printf("[planner] task %s planning error: %v", t.ID, res.err)
+	case res.met:
+		// Autopilot refill: when all goals are met, first ask 'is there anything left'. Untested assets /
+		// high-sev vulns remaining AND waves unused → auto-append the next goal layer; this round doesn't
+		// cancel workers or settle — treat as 'unfinished' and keep planning.
+		if e.maybeExtendAutopilot(t) {
+			res.met = false
+			break
+		}
+		log.Printf("[planner] task %s judged goal met: %s", t.ID, res.reason)
+	default:
+		log.Printf("[planner] task %s planning done", t.ID)
+	}
+	// Auto-wrap-up decision (v0.5.0): only record the reason — the actual settle runs in plannerLoop after
+	// this round's inflight drains (avoids drain waiting on itself).
+	if res.err == nil && ectx.Err() == nil && !e.isSettling(t.ID) {
+		if res.met {
+			t.requestSettle("goal_met", "planner judged the goal achieved")
+		} else {
+			e.recordAndEvaluateAutoFinish(t, round, triggers)
+		}
+	}
+	// Task judged done → immediately cancel running workers: their in-flight intents' output is moot.
+	// Next worker loop hits the terminal gate and stops claiming; the cancelled batch lands in the
+	// 'task finished' branch below as stopped (not blocked).
+	//
+	// Must come after requestSettle (see the function comment). res.err==nil keeps the original switch's
+	// reachability condition: a half-successful round (prove_goal already set GoalMet, then an LLM/transport
+	// error) must not be used to kill workers.
+	if res.met && res.err == nil {
+		e.cancelExec(t.ID, agent.AbortGoalMet)
 	}
 }
 
@@ -1568,12 +1652,20 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// immediately re-claimed and re-run, while the pending goal_met wrap-up never sees HasActiveIntent=false.
 	if canceledByGoalMet(ectx) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
-			log.Printf("[worker %s] task %s intent #%d goal_met-stop write failed: %v", name, t.ID, intent.ID, err)
+			log.Printf("[worker %s] task %s intent #%d goal_met-stop write failed (background retry scheduled): %v", name, t.ID, intent.ID, err)
+			// An intent whose write fails stays at running forever → HasActiveIntent stays true → the
+			// pending goal_met wrap-up never sees "frontier drained". Reuse the terminal-state backfill and
+			// wake the planner (the consumer of the wrap-up predicate) once it succeeds.
+			e.retryIntentTerminalAsync(t.Store, intent.ID, "stopped", db.IntentStopTaskDone, t.Notify)
 		} else {
 			_ = t.Store.SetIntentStopReason(intent.ID, db.IntentStopTaskDone)
 		}
 		log.Printf("[worker %s] task %s intent #%d cancelled on goal-met (stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
+		// Edge wake-up: if workers are still running when the planner decides goal_met, the pending wrap-up
+		// is blocked by HasActiveIntent; once the last worker writes back someone must wake the planner to
+		// consume that predicate, or it waits a whole heartbeat interval (600s default).
+		t.Notify()
 		return true
 	}
 	// Task judged done (via normal path) → cancelExec above cancelled this run. The intent's result is moot —
@@ -1656,7 +1748,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s intent #%d terminal state %s write failed (background retry scheduled): %v", name, t.ID, intent.ID, state, stateErr)
-			e.retryIntentTerminalAsync(t.Store, intent.ID, state, stopReason)
+			e.retryIntentTerminalAsync(t.Store, intent.ID, state, stopReason, t.Notify)
 		} else if stopReason != "" {
 			if err := t.Store.SetIntentStopReason(intent.ID, stopReason); err != nil {
 				log.Printf("[worker %s] task %s intent #%d terminal-reason write failed: %v", name, t.ID, intent.ID, err)

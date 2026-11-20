@@ -2,6 +2,8 @@ package server
 
 import (
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -240,24 +242,36 @@ func loginGuard(w http.ResponseWriter, r *http.Request, action string) bool {
 	return true
 }
 
-// signJWT issues a 7-day HS256 token for user POJUN.
+// signJWT issues a 7-day HS256 token for user POJUN. The jti (audit B1) is the session identity:
+// "revoke the current session" expires exactly that, without touching sign-ins on other devices.
 func signJWT(key []byte) (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate jti: %w", err)
+	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		Subject:   "POJUN",
+		ID:        hex.EncodeToString(buf),
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+// parseJWT validates signature/expiry and returns the parsed token (iat/jti
+// claim accessors live in auth_revoke.go).
+func parseJWT(tokenStr string, key []byte) (*jwt.Token, error) {
+	return jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
-	return err == nil && t.Valid
+}
+
+// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
+func verifyJWT(tokenStr string, key []byte) bool {
+	_, err := parseJWT(tokenStr, key)
+	return err == nil
 }
 
 // sseQueryTokenPaths is the only whitelist of endpoints accepting ?token= query auth:
@@ -315,12 +329,49 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "unauthorized")
 			return
 		}
-		if !verifyJWT(tok, s.currentJWTKey()) {
+		key := s.currentJWTKey()
+		if !verifyJWT(tok, key) {
 			writeErr(w, 401, "invalid or expired token")
+			return
+		}
+		// Audit B1: beyond signature/expiry, also check session revocation (sentinel iat / jti set, memory-cached).
+		iat, jti, _ := parseTokenClaims(tok, key)
+		if s.revocations().revoked(jti, iat) {
+			writeErr(w, 401, "session revoked — sign in again")
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// setupTokenFilename is the first-init token's filename (under dataDir, 0600).
+// Audit B2: after a public deployment and before an admin finishes /setup there is a squatting
+// window — an unauthenticated party can race POST /api/auth/init to set its own password and take
+// over the instance. Init now requires this token.
+const setupTokenFilename = "setup-token"
+
+// ensureSetupToken makes sure an instance with no password set holds a one-time setup token:
+// generate it when the file is missing (32 bytes hex, 0600), reuse it when present. Instances with
+// a password already set get none. Returns (token, file path, err).
+func ensureSetupToken(dataDir string) (string, string, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return "", "", errors.New("dataDir is empty, cannot generate a setup token")
+	}
+	path := filepath.Join(dataDir, setupTokenFilename)
+	if b, err := os.ReadFile(path); err == nil {
+		if tok := strings.TrimSpace(string(b)); tok != "" {
+			return tok, path, nil
+		}
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return "", "", err
+	}
+	tok := hex.EncodeToString(key)
+	if err := os.WriteFile(path, []byte(tok), 0o600); err != nil {
+		return "", "", err
+	}
+	return tok, path, nil
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
@@ -358,6 +409,20 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "password already set")
 		return
 	}
+	// Audit B2: an uninitialized instance must present the setup token (data/setup-token, 0600),
+	// or any request that arrives first on the public internet can set a password and take over.
+	// The file is removed after success.
+	token, tokenPath, terr := ensureSetupToken(s.dataDir)
+	if terr != nil {
+		writeErr(w, 503, "failed to generate the setup token: "+terr.Error())
+		return
+	}
+	if r.Header.Get("X-Setup-Token") != token {
+		w.Header().Set("X-Setup-Token-Path", tokenPath)
+		writeErr(w, 403, "first init needs the setup token: read "+tokenPath+
+			" on the server and retry with it in the X-Setup-Token header (see the startup log for local deployments)")
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -387,6 +452,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "password already set")
 		return
 	}
+	_ = os.Remove(filepath.Join(s.dataDir, setupTokenFilename))
 	tok, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		writeErr(w, 500, "token generation failed")

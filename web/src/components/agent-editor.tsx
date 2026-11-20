@@ -455,7 +455,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   <span className="flex-1 truncate text-muted-foreground">{ver.note}</span>
                   {ver.ts && (
                     <span className="shrink-0 text-muted-foreground/60 tabular-nums">
-                      {new Date(ver.ts).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                      {new Date(ver.ts).toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
                     </span>
                   )}
                   <Button variant="ghost" size="icon-sm" className="size-6 shrink-0" onClick={() => setViewVer(ver)}>
@@ -488,7 +488,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   {viewVer?.note || "(no note)"}
                   {viewVer?.ts && (
                     <span className="ml-2 text-muted-foreground/60">
-                      {new Date(viewVer.ts).toLocaleString("zh-CN")}
+                      {new Date(viewVer.ts).toLocaleString("en-US")}
                     </span>
                   )}
                 </DialogDescription>

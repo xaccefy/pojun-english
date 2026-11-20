@@ -139,6 +139,7 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 // worker/planner sessions — not just the final answer.
 func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
 	tsx := NewToolSet(ts, "human")
+	tsx.SetEgressProxy(m.proxyAddr, m.proxyCACert) // native http_request/session_login share Bash's egress
 	tsx.SetFindingRecorder(m.findingRecorder)
 	tsx.SetScopeFlags(m.scopeGuard, m.scopeInheritWrites, m.crossTaskNotifyDedup)
 	if as != nil {

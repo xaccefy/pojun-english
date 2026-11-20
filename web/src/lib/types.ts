@@ -1033,8 +1033,9 @@ export interface Settings {
   // Global egress proxy (http/https/socks5, may include user:pass); all target traffic goes through it. Acts as the
   // MITM upstream when traffic capture is on; injected straight into the agent's bash/WebFetch when capture is off. Empty = direct.
   global_proxy?: string;
-  // Installer proxy (http/https/socks5), only used for apt/curl/GitHub downloads while installing host tools.
-  // Fully independent of the target-traffic proxy, search proxy and LLM proxy. Empty = direct.
+  // Installer proxy (http/https/socks5), used for host-tool installs, program updates and other maintenance requests.
+  // Fully independent of the target-traffic proxy, search proxy and LLM proxy. Empty = may come from POJUN_INSTALL_PROXY.
+  // Empty = direct.
   install_proxy?: string;
   python_interpreter?: string; // python interpreter path for custom script tools (empty = detected at runtime)
   workers?: number; // number of concurrent worker agents (default 3); applies to tasks started afterwards
@@ -1191,6 +1192,9 @@ export interface LLMProfile {
   // Custom session header name: when non-empty, every request carries this HTTP header with the current conversation/intent session id.
   // "" = do not send. For gateways that do prompt caching/sticky routing on a session-id header.
   session_header_key?: string;
+  // User-Agent for LLM requests: non-empty replaces the UA on every model request; ""=keep the SDK/Go default.
+  // For gateways/WAFs that reject the default Go-http-client UA outright.
+  user_agent?: string;
   // This profile's overrides for retries (connect/empty response/same-provider safety window). Blank/all 0 = follow the global policy.
   retry?: LLMRetryOverride;
 }
@@ -1408,6 +1412,8 @@ export interface InterceptRule {
   priority: number;
   match_target: InterceptMatchTarget;
   match_type: InterceptMatchType;
+  // Tool names this rule applies to; empty array/absent = any tool. Only meaningful for match_target=tool_input.
+  tool_scope?: string[];
   pattern: string;
   action: InterceptAction;
   message: string;
@@ -1774,6 +1780,13 @@ export interface HostTool {
   category: "network" | "dns" | "web" | "cred" | "code" | "pivot" | "oob" | "exploit" | "material" | "runtime" | "middleware" | "";
 }
 
+export type InstallSourcePreset = "" | "tencent" | "tuna";
+
+export interface HostInstallSources {
+  apt: InstallSourcePreset;
+  pypi: InstallSourcePreset;
+}
+
 /** Whether one-click install is available; depends on the privileged helper pojun-hostd being online (not online under Docker). */
 export interface HostenvInstaller {
   available: boolean;
@@ -1784,6 +1797,8 @@ export interface HostenvInstaller {
   upgrade_required?: boolean;
   socket: string;
   proxy: string;
+  sources?: HostInstallSources;
+  sources_supported?: boolean;
 }
 
 export interface HostenvStatus {
@@ -1849,8 +1864,19 @@ export interface ProxyPoolRunning {
 export interface ProxyPoolState {
   entries: ProxyPoolEntry[];
   strategy: string;
+  /** Master switch: when false the entries take no part in exit selection (fall back to the global proxy/direct). */
+  enabled: boolean;
   running: ProxyPoolRunning[];
+  /** number of entries not tripped (0 = none currently usable). */
+  usable?: number;
+  total?: number;
+  /** number of entries actually taking part in exit selection (after the socks5 policy filter). */
+  effective_total?: number;
+  socks5_blocked?: number;
+  socks5_allowed?: boolean;
   capturing: boolean;
+  /** Strict egress: with a pool configured but fully unusable, direct fallback is forbidden (on by default). */
+  strict?: boolean;
   check_target?: string;
   health_minutes?: number;
   health_cooldown?: number;
@@ -1969,3 +1995,71 @@ export interface C2ConfigPatch {
   key?: string;
   iface?: string;
 }
+
+export interface ProxyPoolSubscription {
+  format: "uri" | "clash";
+  supported: string[];
+  text: string;
+  unsupported: number;
+  invalid: number;
+  /** non-node info lines mixed into the subscription (remaining quota/expiry/homepage etc.), ignored. */
+  ignored?: number;
+  note?: string;
+  /** format=clash only: the full YAML (with node credentials; the frontend only uses it to start mihomo). */
+  clash_yaml?: string;
+  proxies?: number;
+  direct_nodes?: number;
+  local_ports?: number[];
+  proxy_groups?: number;
+  group_names?: string[];
+  proxy_providers?: number;
+  /** Clash node: name and type only, no account/address. */
+  nodes?: { name: string; type: string }[];
+  /** Clash group: name, type and member node names (for the node management page). */
+  groups?: { name: string; type: string; members?: string[] }[];
+}
+
+export interface LocalProxyCandidate {
+  url: string;
+  port: number;
+  ok: boolean;
+  latency_ms: number;
+  exit_ip?: string;
+  error?: string;
+  source: string;
+}
+
+export interface MihomoStatus {
+  running: boolean;
+  installed: boolean;
+  port: number;
+  pid: number;
+  binary: string;
+  config_path: string;
+  log_path: string;
+  started_at?: string;
+  version?: string;
+  last_error?: string;
+  /** the outbound actually in effect in the config file (derived from the rules MATCH). */
+  outbound?: string;
+  /** group/node/load-balance/url-test/fallback */
+  mode?: string;
+  /** node names the outbound group contains (a single one when a node is named directly). */
+  nodes?: string[];
+  /** external-controller port for this start (loopback-bound only, used for node delay tests). */
+  controller_port?: number;
+}
+
+export interface SSHProvider {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  credential_id?: number;
+  created_at?: string;
+  status?: string;
+  socks_addr?: string;
+  started_at?: string;
+}
+

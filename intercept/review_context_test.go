@@ -3,6 +3,8 @@ package intercept
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -69,7 +71,7 @@ func TestReviewInputExplicitBackgroundOnly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if in.Version != 4 || in.WorkingDir != "/tmp/task-1" {
+			if in.Version != 5 || in.WorkingDir != "/tmp/task-1" {
 				t.Fatalf("wrong environment: %+v", in)
 			}
 			if source == BackgroundUserMessage {
@@ -154,7 +156,7 @@ func TestAutomaticAllowRetainsActualReviewContext(t *testing.T) {
 	reason := "Actual action: read the test file; Consequence on success: returns file content; Matched rule: A5"
 	a := auditFor(ctx, Decision{Action: "allow", Message: reason, ModelInput: raw, ModelInputDigest: digestInput(raw)}, args, "allowed")
 	var saved ReviewInput
-	if json.Unmarshal(a.ModelInput, &saved) != nil || saved.Background == nil || saved.Background.Text != "please read the file just created" || saved.Version != 4 || a.Correlation != "exact" || a.ToolUseID != "current" || a.InitialReason != reason {
+	if json.Unmarshal(a.ModelInput, &saved) != nil || saved.Background == nil || saved.Background.Text != "please read the file just created" || saved.Version != 5 || a.Correlation != "exact" || a.ToolUseID != "current" || a.InitialReason != reason {
 		t.Fatal("automatic allow lost the model's input or explanation")
 	}
 	if a.Context != nil || a.UserMessage != "" {
@@ -180,5 +182,69 @@ func TestReviewWorkingDirectoryPreservesExplicitProvenance(t *testing.T) {
 		} else if in.Background == nil || *in.Background != background {
 			t.Fatal("raw user message was replaced by augmented Agent input")
 		}
+	}
+}
+
+// issue #21.2：命令行引用的本地脚本正文要进 ReviewInput——「先落盘再执行」的
+// 载荷不能只让审查层看到文件名。
+func TestBuildReviewInputAttachesScripts(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "shared", "scripts")
+	if err := os.MkdirAll(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "import os\nos.system('rm -rf /tmp/target')"
+	if err := os.WriteFile(filepath.Join(script, "exp.py"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(script, "helper.sh"), []byte("echo hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithReviewWorkingDirectory(context.Background(), dir)
+	args := json.RawMessage(`{"command":"timeout 300 python3 shared/scripts/exp.py && bash 'shared/scripts/helper.sh' && python3 gen/$RUN.py"}`)
+	in, err := BuildReviewInput(ctx, "Bash", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(in.Scripts) != 2 {
+		t.Fatalf("应解析出 2 个静态脚本，得 %d：%+v", len(in.Scripts), in.Scripts)
+	}
+	found := map[string]bool{}
+	for _, sc := range in.Scripts {
+		found[sc.Path] = true
+	}
+	if !found["shared/scripts/exp.py"] || !found["shared/scripts/helper.sh"] {
+		t.Fatalf("脚本路径缺失：%+v", in.Scripts)
+	}
+	for _, sc := range in.Scripts {
+		if sc.Body == "" {
+			t.Fatalf("%s 正文为空", sc.Path)
+		}
+	}
+	if sc := in.Scripts[0]; sc.Path == "shared/scripts/exp.py" && !strings.Contains(sc.Body, "os.system") {
+		t.Fatalf("exp.py 正文不符：%q", sc.Body)
+	}
+	// 动态路径进 unresolved，不猜值
+	if len(in.UnresolvedScripts) != 1 || !strings.Contains(in.UnresolvedScripts[0], "gen/$RUN.py") {
+		t.Fatalf("动态路径应进 unresolved：%+v", in.UnresolvedScripts)
+	}
+}
+
+// issue #21.2：非普通文件（设备/管道/目录）不读正文，进 unresolved——
+// 读命名管道或 /dev/zero 会把 PreToolUse 挂死（agent/tools_diff.go 的同一课）。
+func TestBuildReviewInputSkipsNonRegularScripts(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "not-a-script.sh")
+	if err := os.Mkdir(fake, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithReviewWorkingDirectory(context.Background(), dir)
+	args := json.RawMessage(`{"command":"bash not-a-script.sh"}`)
+	in, err := BuildReviewInput(ctx, "Bash", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(in.Scripts) != 0 || len(in.UnresolvedScripts) != 1 {
+		t.Fatalf("目录应跳过：scripts=%d unresolved=%d", len(in.Scripts), len(in.UnresolvedScripts))
 	}
 }

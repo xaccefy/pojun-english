@@ -251,12 +251,23 @@ func taskGoalProgress(t *Task) (met, total int) {
 
 // settleTerminalStatus computes the settle terminal state (demoted in red-team v0.6.31).
 //
-// Semantics: only 'all goals achieved' allows done; whenever a goal is unachieved, no
-// matter the settle reason (timeout / auto-idle / coverage / round cap), the terminal
-// state is timeout — the UI shows 'incomplete' instead of marking a half-done task
-// complete. totalGoals==0 tasks keep the old semantics.
-func settleTerminalStatus(allGoalsMet bool, reason string, finalRoundMet bool) string {
-	if !allGoalsMet {
+// Semantics: with goals present, the **database's achievement state** decides — only all-met is done;
+// with any unachieved goal (state=abandoned counts as unachieved), no matter the settle reason
+// (timeout / auto-idle / coverage / round cap), the terminal state is timeout — the UI shows
+// 'incomplete' instead of marking a half-done task complete. Tasks with no goals (totalGoals==0)
+// keep the old semantics: the final planner round decides.
+//
+// Why finalRoundMet (the final round planner's return) isn't trusted: a goal's met can only be
+// written by prove_goal — an established fact left by per-item evidence, and no tool can set it
+// back; finalRoundMet only means "the final round called a proving tool again". With every goal
+// already met the final round has nothing left to prove, so the planner usually answers "nothing
+// left to prove", and finalRoundMet=false offers no contrary evidence there — it can't overturn an
+// established achievement.
+func settleTerminalStatus(metGoals, totalGoals int, reason string, finalRoundMet bool) string {
+	if totalGoals > 0 {
+		if metGoals >= totalGoals {
+			return "done"
+		}
 		return "timeout"
 	}
 	if reason == "timeout" && !finalRoundMet {
@@ -271,10 +282,10 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 }
 
 // settleTaskWithReason is the unified settle entry. reason:
-//   - timeout      absolute task deadline (terminal met?done:timeout)
-//   - goal_met     planner judged goals met and no intents running (no final round —
-//     straight to done)
-//   - auto_idle / auto_coverage / auto_rounds  programmatic auto-settle (terminal done)
+//   - timeout      absolute task deadline (terminal state from goal progress: all met→done, else timeout;
+//     goal-less tasks are judged by the final round)
+//   - goal_met     planner explicitly judged goals met and no intents running (no final round — straight to done)
+//   - auto_idle / auto_coverage / auto_rounds  programmatic auto-settle (terminal state also from goal progress)
 func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, detail string) {
 	if !e.markSettling(t.ID, reason) {
 		return
@@ -334,15 +345,13 @@ func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, deta
 	// final round — can only prompt the human to complete them).
 	e.warnFindingsWithoutReport(t)
 
-	// (6) commit terminal state (guarded): only 'all goals proven achieved' counts as
-	// done. Demoted in red-team v0.6.31: auto-settles (idle/coverage/rounds) and goal_met
-	// with unachieved goals all land on timeout — the UI shows 'incomplete · stopped'.
-	// The old 'auto-settle always done' was the source of 'half-finished but shown
-	// complete'.
+	// (6) commit terminal state (guarded): with goals present the database's achievement state decides
+	// (see settleTerminalStatus). Demoted in red-team v0.6.31: auto-settles (idle/coverage/rounds) and
+	// goal_met with unachieved goals all land on timeout, and the UI shows 'incomplete · stopped' — the
+	// old 'auto-settle always done' was the source of 'half-finished but shown complete'.
 	metGoals, totalGoals := taskGoalProgress(t)
-	allGoalsMet := totalGoals == 0 || metGoals >= totalGoals
-	status := settleTerminalStatus(allGoalsMet, reason, met)
-	if status == "timeout" && !allGoalsMet {
+	status := settleTerminalStatus(metGoals, totalGoals, reason, met)
+	if status == "timeout" && metGoals < totalGoals {
 		log.Printf("[settle] task %s goals not all achieved (%d/%d) — terminal state timeout (incomplete), not done", t.ID, metGoals, totalGoals)
 	}
 	won, err := e.m.SetTaskStatusGuarded(t.ID, status)

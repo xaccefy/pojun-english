@@ -50,6 +50,15 @@ jobs:
         with:
           name: web-dist
           path: server/webui/dist
+      # 同 ci.yml：module proxy 偶发断流时重试，避免整个 Release 被一次瞬时网络错误拖红。
+      - name: Download Go modules (retry transient proxy errors)
+        run: |
+          for i in 1 2 3 4; do
+            if go mod download; then exit 0; fi
+            echo "go mod download failed (attempt $i), retrying in $((i * 10))s..."
+            sleep $((i * 10))
+          done
+          go mod download
       - name: Build and package with build.sh
         env:
           POJUN_TARGET_OS: ${{ matrix.goos }}
@@ -127,12 +136,21 @@ jobs:
             echo ""
             echo "## What changed in this version"
             echo ""
-            # Extract this version's full section from CHANGELOG.md (from ## [VER] to the next ##)
-            awk -v ver="## [$VER]" '
-              $0 ~ ver { flag = 1; next }
-              flag && /^## / { exit }
-              flag { print }
-            ' CHANGELOG.md
+          # Extract this version's full section from CHANGELOG.md (from ## [VER] to the next ##).
+          # Use index() for a literal prefix match: awk's ~ treats "[0.4.74]" as a
+          # character class, so a bracketed version heading never matches and the
+          # appendix line "## 0.4.4 – 0.4.19" is picked up instead — the root cause
+          # of the full stale table pasted into the v0.4.73~0.4.75 Release pages.
+          FOUND=$(awk -v ver="## [$VER]" '
+            index($0, ver) == 1 { flag = 1; next }
+            flag && /^## / { exit }
+            flag { print }
+          ' CHANGELOG.md)
+          if [ -z "$FOUND" ]; then
+            echo "::error::CHANGELOG.md has no ## [$VER] section; refusing to publish a Release with empty notes"
+            exit 1
+          fi
+          printf '%s\n' "$FOUND"
             echo ""
             echo "---"
             echo ""

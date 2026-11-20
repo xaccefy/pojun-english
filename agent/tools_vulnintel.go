@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"os/exec"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -310,6 +311,52 @@ func shellJoinArgs(args []string) string {
 	return strings.Join(out, " ")
 }
 
+// nucleiScanArgs maps the tool args and the current egress proxy onto vulnintel.ScanArgs.
+// The egress is wired in this one place: egressProxy is injected by SetEgressProxy (assembled in
+// worker/planner/mainagent), same source as Bash's HTTP(S)_PROXY. A separate function so it can be
+// asserted with no nuclei and no PG.
+func (t *ToolSet) nucleiScanArgs(target, cveID, severity string) vulnintel.ScanArgs {
+	return vulnintel.ScanArgs{
+		Target:       target,
+		CVEID:        cveID,
+		Severity:     severity,
+		TimeoutTotal: 10 * time.Minute,
+		Proxy:        t.egressProxy,
+	}
+}
+
+// nucleiBashCommand turns ScanArgs into a command string ready for Bash: every arg single-quoted,
+// plus an outer total-timeout when GNU timeout exists and it isn't Windows. Extracted because binary
+// and arg validation sit ahead of the callback, so unit tests can't reach the -proxy injection and
+// quoting — previously only manually verified.
+func nucleiBashCommand(templatesDir string, a vulnintel.ScanArgs) (string, error) {
+	cmd, cancel, err := vulnintel.BuildNucleiCmd(context.Background(), templatesDir, a)
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+	run := shellJoinArgs(cmd.Args)
+	// Total timeout: wrap in GNU timeout when present (Linux production has it by default); otherwise
+	// rely on the Bash tool's own timeout. Seconds derive from TimeoutTotal and share EffectiveTimeout's
+	// 0→10m / >30m→30m clamp with BuildNucleiCmd so the two rules can't drift; BuildNucleiCmd's context
+	// timeout never fires — the real cap is here.
+	if tp, terr := exec.LookPath("timeout"); terr == nil && runtime.GOOS != "windows" {
+		secs := int(vulnintel.EffectiveTimeout(a.TimeoutTotal) / time.Second)
+		run = quoteShell(tp) + " " + strconv.Itoa(secs) + " " + run
+	}
+	return run, nil
+}
+
+// nucleiEgressNote prefixes a troubleshooting line when an egress proxy is configured: with -silent an
+// unreachable egress can leave only empty stdout, and the note reads empty output as "no hits" — without
+// the hint an egress failure looks like a clean target.
+func nucleiEgressNote(proxy string) string {
+	if strings.TrimSpace(proxy) == "" {
+		return ""
+	}
+	return "the command already carries -proxy (injected from the platform egress proxy); if there is no output for a long time, check the Bash exit code/error and diagnose the egress with proxy_status before concluding no hits."
+}
+
 // scanWithNuclei assembles a nuclei command for the worker's Bash tool. The
 // tool deliberately does NOT execute nuclei itself: Bash runs it through the
 // recording proxy + approval gates like every other command, keeping audit
@@ -350,25 +397,18 @@ func (t *ToolSet) scanWithNuclei() actool.CoreTool {
 			if a.Severity != "" && !nucleiSeverityRE.MatchString(strings.TrimSpace(a.Severity)) {
 				return actool.Errorf("severity only allows a comma-combination of critical/high/medium/low/info"), nil
 			}
-			cmd, cancel, err := vulnintel.BuildNucleiCmd(context.Background(), nucleiTemplatesDir, vulnintel.ScanArgs{
-				Target:       a.Target,
-				CVEID:        a.CVEID,
-				Severity:     a.Severity,
-				TimeoutTotal: 10 * time.Minute,
-			})
+			run, err := nucleiBashCommand(nucleiTemplatesDir, t.nucleiScanArgs(a.Target, a.CVEID, a.Severity))
 			if err != nil {
 				return actool.Errorf("failed to build the scan command: " + err.Error()), nil
 			}
-			defer cancel()
-			run := shellJoinArgs(cmd.Args)
-			// Total timeout: wrap in GNU timeout when present (Linux production has it by default); otherwise rely on the Bash tool's own timeout.
-			if tp, terr := exec.LookPath("timeout"); terr == nil && runtime.GOOS != "windows" {
-				run = quoteShell(tp) + " 600 " + run
+			note := "run the command above with the Bash tool (default 10-min timeout — output truncates past it); " +
+				"output is JSONL, one template hit per line; empty output = no hits. After finding a real vuln, report normally via report_finding."
+			if pre := nucleiEgressNote(t.egressProxy); pre != "" {
+				note = pre + " " + note
 			}
 			return jsonResult(map[string]any{
 				"run_with_bash": run,
-				"note": "run the command above with the Bash tool (default 10-min timeout — output truncates past it); " +
-					"output is JSONL, one template hit per line; empty output = no hits. After finding a real vuln, report normally via report_finding.",
+				"note":          note,
 			})
 		},
 	)

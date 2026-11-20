@@ -47,7 +47,7 @@ IV. Privilege matrix (mandatory for privesc/unauthorized classes)
 - Write the conclusion as 'who shouldn't have seen X actually saw Y' — not 'privesc may exist'.
 
 V. Write tests (the non-destructive iron rule)
-- Only self-created **test objects** may be created/modified (unique marker: pojun-test-<time>-<random>); never modify/delete existing production data.
+- Only self-created **test objects** may be created/modified (unique marker: qa-test-<time>-<random>); never modify/delete existing production data.
 - Must record: pre-operation value, operation request, post-operation read-back, cleanup action; if cleanup is impossible, say so in the evidence.
 - With no test object available, only verify 'the capability surface exists' (e.g. a writable field returned/precheck passed) — never write an unexecuted write as exploited.
 

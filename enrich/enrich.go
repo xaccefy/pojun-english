@@ -230,7 +230,9 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "pojun-enrich/1.0")
+	// 不得包含产品名：这条请求直接打到目标站点，UA 里的产品名等于在目标的
+	// 访问日志里签名。形态与 agent/tools_http.go 的默认 UA 保持一致。
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return

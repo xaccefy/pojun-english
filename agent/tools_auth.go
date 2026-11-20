@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"strconv"
 	"strings"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -111,13 +111,29 @@ func (t *ToolSet) authRequest() actool.CoreTool {
 			}
 			idx := a.AuthIndex
 			if idx < 0 {
-				idx = 0
+				// 审计 F1：未传索引时选第一条【有效】凭据（保持旧行为的便利性）。
+				first := -1
+				for i, e := range entries {
+					if e.valid() {
+						first = i
+						break
+					}
+				}
+				if first < 0 {
+					return actool.Errorf(fmt.Sprintf(
+						"asset %d has no valid credential entry (%d placeholders)", a.AssetID, len(entries))), nil
+				}
+				idx = first
 			}
 			if idx >= len(entries) {
 				return actool.Errorf(fmt.Sprintf(
 					"asset %d only has %d credentials, auth_index=%d out of range", a.AssetID, len(entries), idx)), nil
 			}
 			entry := entries[idx]
+			if !entry.valid() {
+				return actool.Errorf(fmt.Sprintf(
+					"auth_index=%d on asset %d is not a valid credential entry; valid indices: %s", a.AssetID, idx, validAuthIndices(entries))), nil
+			}
 
 			method := strings.ToUpper(strings.TrimSpace(a.Method))
 			if method == "" {
@@ -144,13 +160,21 @@ func (t *ToolSet) authRequest() actool.CoreTool {
 // Asset auth is []map[string]any (key names aren't fixed — historically username/
 // password/token/type/description). Lenient parse: use recognized keys, ignore the rest,
 // but **at least one usable field** is required to count as a credential.
+// parseAuthEntries turns an asset's auth array into a credential list of the same length and order.
+//
+// Audit F1: it used to drop empty entries and reorder tokens first — list_assets shows the model the raw
+// array order, while session_login/auth_request index via parseAuthEntries, so the two drifted apart and
+// the model's chosen credential differed from the one actually sent (false "invalid credential", wrong
+// login-breaker counting). Original order is kept now: invalid entries hold a zero value and the caller
+// checks authEntry.valid() and reports it.
 func parseAuthEntries(raw []map[string]any) []authEntry {
-	out := []authEntry{}
+	out := make([]authEntry, 0, len(raw))
 	for _, m := range raw {
+		var e authEntry
 		if m == nil {
+			out = append(out, e)
 			continue
 		}
-		var e authEntry
 		for k, v := range m {
 			s, _ := v.(string)
 			s = strings.TrimSpace(s)
@@ -167,21 +191,26 @@ func parseAuthEntries(raw []map[string]any) []authEntry {
 				e.Description = s
 			}
 		}
-		if e.Username == "" && e.Password == "" && e.Token == "" {
-			continue // no usable field — doesn't count as a credential
-		}
 		out = append(out, e)
 	}
-	// Sort: tokens first (nothing to assemble), then login pairs — default auth_index=0 grabs the most convenient.
-	sort.SliceStable(out, func(i, j int) bool {
-		ti := out[i].Token != ""
-		tj := out[j].Token != ""
-		if ti != tj {
-			return ti
-		}
-		return false
-	})
 	return out
+}
+
+// valid reports whether this credential has at least one usable field.
+func (e authEntry) valid() bool {
+	return e.Username != "" || e.Password != "" || e.Token != ""
+}
+
+// validAuthIndices returns the indices of the valid credentials (matching the asset auth array's
+// original indices), so an error message can steer the model to one of them.
+func validAuthIndices(entries []authEntry) string {
+	ids := make([]string, 0, len(entries))
+	for i, e := range entries {
+		if e.valid() {
+			ids = append(ids, strconv.Itoa(i))
+		}
+	}
+	return strings.Join(ids, ",")
 }
 
 // authKind describes this credential's form (for the result's note — no credential values).

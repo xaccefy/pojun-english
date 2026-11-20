@@ -634,6 +634,9 @@ type LLMProfileDTO struct {
 	// header with value = current session/intent's session id. ''=don't send. For
 	// gateways that do prompt caching / sticky routing by session-id header.
 	SessionHeaderKey string `json:"session_header_key"`
+	// User-Agent for LLM requests: non-empty replaces the UA on every model request; ''=keep the SDK/Go default.
+	// For gateways/WAFs that reject the default Go-http-client UA outright.
+	UserAgent string `json:"user_agent"`
 	// this profile's retry overrides (connect / empty-response / same-provider safe
 	// window). Per item attempts: 0=inherit global policy | -1=disable that retry
 	// layer | >0=count; interval_ms: 0=default exponential backoff | >0=fixed ms
@@ -662,6 +665,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		UserAgent:        p.UserAgent,
 		Retry:            p.Retry,
 	}
 }

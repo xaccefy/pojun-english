@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chu0119/pojun/hostd"
 	"github.com/chu0119/pojun/hosttools"
 	"github.com/chu0119/pojun/proxyprobe"
 	"github.com/chu0119/pojun/selfupdate"
@@ -67,8 +68,9 @@ func (s *Server) hostdProbe(ctx context.Context) (bool, string) {
 	return true, ""
 }
 
-// installProxy reads the 'install-time egress proxy' setting. Unrelated to runtime
-// target/LLM proxies: it only affects apt/curl/GitHub downloads.
+// installProxy reads the 'install-time egress proxy' setting, used by host-tool installs and
+// program updates — maintenance requests. Unrelated to runtime target/LLM proxies: it only affects
+// apt/curl/GitHub downloads.
 //
 // Env var POJUN_INSTALL_PROXY is the fallback: Docker form has no config.json —
 // install.sh can only inject via compose. The DB setting wins (page-editable); the env
@@ -83,8 +85,8 @@ func (s *Server) installProxy() string {
 	return strings.TrimSpace(os.Getenv("POJUN_INSTALL_PROXY"))
 }
 
-// maintenanceProxy picks the proxy for maintenance egress (checking/downloading
-// updates, installing host tools).
+// maintenanceProxy picks the proxy for maintenance egress (checking/downloading updates,
+// upgrading the host helper).
 //
 // Prefers the 'install proxy' — it exists for 'pulling things from GitHub'; old
 // deployments without it fall back to the global proxy, keeping behavior unchanged.
@@ -100,10 +102,55 @@ func (s *Server) maintenanceProxy() string {
 	return s.m.GlobalProxy()
 }
 
+const settingHostInstallSources = "host_install_sources"
+
+func (s *Server) hostInstallSources() (hostd.InstallSources, error) {
+	var sources hostd.InstallSources
+	if s.m == nil || s.m.pg == nil {
+		return sources, nil
+	}
+	raw, ok, err := s.m.pg.GetSetting(settingHostInstallSources)
+	if err != nil || !ok || raw == "" {
+		return sources, err
+	}
+	if err := json.Unmarshal([]byte(raw), &sources); err != nil {
+		return sources, err
+	}
+	return sources, sources.Validate()
+}
+
+func (s *Server) hostenvSaveSources(w http.ResponseWriter, r *http.Request) {
+	var sources hostd.InstallSources
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&sources); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad install-source setting format")
+		return
+	}
+	if err := sources.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.m == nil || s.m.pg == nil {
+		writeErr(w, http.StatusServiceUnavailable, "setting store unavailable")
+		return
+	}
+	raw, _ := json.Marshal(sources)
+	if err := s.m.pg.SetSetting(settingHostInstallSources, string(raw)); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to save the install-source setting")
+		return
+	}
+	writeJSON(w, http.StatusOK, sources)
+}
+
 // hostenvStatus is the health page's main entry: tool list + whether one-click install
 // is supported.
 func (s *Server) hostenvStatus(w http.ResponseWriter, r *http.Request) {
-	ver, present := s.hostdVersion(r.Context())
+	sources, err := s.hostInstallSources()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read the install-source setting")
+		return
+	}
+	info, present := s.hostdInfo(r.Context())
+	ver := info.Version
 	reason := ""
 	if !present {
 		reason = "host helper not running (pojun-hostd not installed, or this is a Docker deployment)"
@@ -118,9 +165,11 @@ func (s *Server) hostenvStatus(w http.ResponseWriter, r *http.Request) {
 			// old helpers (pre-0.3.22) neither report a version nor have /self-upgrade —
 			// they can't re-dress themselves; ops must rerun install.sh once to bootstrap,
 			// then they follow the main program's upgrades automatically.
-			"upgrade_required": present && ver == "",
-			"socket":           hostdSocket(),
-			"proxy":            s.installProxy(), // echo the current install proxy; editable in the frontend
+			"upgrade_required":  present && ver == "",
+			"socket":            hostdSocket(),
+			"proxy":             s.installProxy(), // echo the current install proxy; editable in the frontend
+			"sources":           sources,
+			"sources_supported": info.InstallSources,
 		},
 	})
 }
@@ -140,15 +189,17 @@ func (s *Server) hostenvInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	// the whitelist is gated here first (the helper re-checks too), avoiding pointless
 	// cross-process calls.
-	if _, ok := hosttools.Lookup(req.ID); !ok {
+	tool, ok := hosttools.Lookup(req.ID)
+	if !ok {
 		writeErr(w, 400, "unknown tool: "+req.ID)
 		return
 	}
-	payload, _ := json.Marshal(map[string]string{
-		"tool_id": req.ID,
-		"proxy":   s.installProxy(),
-	})
-	body, code, err := s.hostdCall(r.Context(), http.MethodPost, "/jobs", payload)
+	sources, err := s.hostInstallSources()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read the install-source setting")
+		return
+	}
+	body, code, err := s.forwardHostInstall(r.Context(), tool, s.installProxy(), sources)
 	if err != nil {
 		writeErr(w, 503, err.Error())
 		return
@@ -156,6 +207,23 @@ func (s *Server) hostenvInstall(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_, _ = w.Write(body)
+}
+
+func (s *Server) forwardHostInstall(ctx context.Context, tool hosttools.Tool, proxy string, sources hostd.InstallSources) ([]byte, int, error) {
+	path := "/jobs"
+	if tool.Kind == hosttools.KindApt && sources.APT != "" || tool.Kind == hosttools.KindPip && sources.PyPI != "" {
+		path = "/jobs/with-sources"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"tool_id": tool.ID,
+		"proxy":   proxy,
+		"sources": sources,
+	})
+	body, code, err := s.hostdCall(ctx, http.MethodPost, path, payload)
+	if err == nil && code == http.StatusNotFound && path == "/jobs/with-sources" {
+		return []byte(`{"error":"this host-helper version doesn't support install-source options; upgrade the helper or restore the system default sources"}`), http.StatusConflict, nil
+	}
+	return body, code, err
 }
 
 // hostenvInstallBatch launches a batch install — the 'install all' backend.
@@ -182,6 +250,11 @@ func (s *Server) hostenvInstallBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxy := s.installProxy()
+	sources, err := s.hostInstallSources()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read the install-source setting")
+		return
+	}
 	type jobOK struct {
 		JobID  string `json:"job_id"`
 		ToolID string `json:"tool_id"`
@@ -199,12 +272,12 @@ func (s *Server) hostenvInstallBatch(w http.ResponseWriter, r *http.Request) {
 			continue // blank and duplicate entries are silently skipped
 		}
 		seen[id] = true
-		if _, ok := hosttools.Lookup(id); !ok {
+		tool, ok := hosttools.Lookup(id)
+		if !ok {
 			skipped = append(skipped, skip{ToolID: id, Reason: "unknown tool"})
 			continue
 		}
-		payload, _ := json.Marshal(map[string]string{"tool_id": id, "proxy": proxy})
-		body, code, err := s.hostdCall(r.Context(), http.MethodPost, "/jobs", payload)
+		body, code, err := s.forwardHostInstall(r.Context(), tool, proxy, sources)
 		if err != nil {
 			// helper wholly unavailable: the rest would fail the same way.
 			writeErr(w, 503, err.Error())
@@ -339,20 +412,29 @@ func errConnectHostd(err error) error {
 // **lacks /self-upgrade**: it can't re-dress itself; ops must rerun install.sh once to
 // bootstrap.
 func (s *Server) hostdVersion(ctx context.Context) (version string, present bool) {
+	info, present := s.hostdInfo(ctx)
+	return info.Version, present
+}
+
+type hostdInfo struct {
+	Version        string `json:"version"`
+	InstallSources bool   `json:"install_sources"`
+}
+
+func (s *Server) hostdInfo(ctx context.Context) (hostdInfo, bool) {
 	if body, code, err := s.hostdCall(ctx, http.MethodGet, "/version", nil); err == nil && code == http.StatusOK {
-		var v struct {
-			Version string `json:"version"`
-		}
-		if json.Unmarshal(body, &v) == nil && strings.TrimSpace(v.Version) != "" {
-			return strings.TrimSpace(v.Version), true
+		var info hostdInfo
+		if json.Unmarshal(body, &info) == nil {
+			info.Version = strings.TrimSpace(info.Version)
+			if info.Version != "" || info.InstallSources {
+				return info, true
+			}
 		}
 	}
 	// fall back to /healthz: old versions have it but not /version. An answer means the
 	// helper is there.
-	if _, code, err := s.hostdCall(ctx, http.MethodGet, "/healthz", nil); err == nil && code == http.StatusOK {
-		return "", true
-	}
-	return "", false
+	_, code, err := s.hostdCall(ctx, http.MethodGet, "/healthz", nil)
+	return hostdInfo{}, err == nil && code == http.StatusOK
 }
 
 // StartHostdReconcile aligns the helper's version with the main program's in the
@@ -408,6 +490,13 @@ func (s *Server) reconcileHostdOnce() bool {
 		// re-dress themselves. This is a one-time bootstrap window: rerun install.sh once
 		// to swap in a self-upgrading helper, then every release follows automatically.
 		log.Printf("[hostd] helper too old (no version report / self-upgrade) — rerun install.sh once to bootstrap")
+		return true
+	}
+	// Audit B9: no automatic downgrade when the helper is newer than the main program — after a manual
+	// main-program rollback the reconcile loop would drag the helper back too, silently reverting a known
+	// fix. The hostd side also refuses downgrade requests.
+	if cmp, comparable := selfupdate.CompareVersions(got, want); comparable && cmp > 0 {
+		log.Printf("[hostd] helper version %s is higher than main %s, skipping the automatic downgrade (rerun install.sh to align)", got, want)
 		return true
 	}
 	log.Printf("[hostd] version mismatch (helper %s / main %s), requesting self-upgrade", got, want)

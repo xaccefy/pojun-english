@@ -281,14 +281,16 @@ Priority 5: Import/export, template rendering → XXE, SSTI
 
 Scanning all templates once is not progress. Narrow the templates only when known CVEs / exposed surfaces require it.
 
+With an egress proxy configured (i.e. `$EGRESS_PROXY` non-empty in Bash), a hand-written `nuclei` command must carry `-proxy "$EGRESS_PROXY"`, or a direct connection exposes the real IP; `scan_with_nuclei` already adds it, don't add it twice. The examples use `${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}`: with no proxy configured the whole segment disappears, so no empty `-proxy` makes nuclei error out.
+
 ```bash
 # Narrow: known CVEs / exposed surfaces, not a full sweep as the opener
-nuclei -u https://target.com -t cves/ -severity critical,high
-nuclei -u https://target.com -t exposures/
-nuclei -u https://target.com -t misconfiguration/
+nuclei -u https://target.com -t cves/ -severity critical,high ${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}
+nuclei -u https://target.com -t exposures/ ${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}
+nuclei -u https://target.com -t misconfiguration/ ${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}
 
 # On subdomain list:
-cat subdomains.txt | nuclei -t exposures/ -t misconfiguration/ -o exposed.txt
+cat subdomains.txt | nuclei -t exposures/ -t misconfiguration/ -o exposed.txt ${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}
 ```
 
 ---

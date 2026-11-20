@@ -45,7 +45,7 @@ func TestAssetURLMatchesRealReleaseNames(t *testing.T) {
 		{
 			// feroxbuster puts the architecture first
 			"feroxbuster", "v2.13.1",
-			"https://github.com/epi052/feroxbuster/releases/download/v2.13.1/x86_64-linux-feroxbuster.tar.gz",
+			"https://github.com/epi052/feroxbuster/releases/download/v2.13.1/x86_64-linux-feroxbuster.zip",
 		},
 		{
 			"notify", "v1.0.7",
@@ -62,7 +62,8 @@ func TestAssetURLMatchesRealReleaseNames(t *testing.T) {
 			t.Errorf("%s is not in the catalog", c.id)
 			continue
 		}
-		got := GitHubAssetURL(tool, c.tag)
+		tmpl := strings.Split(tool.AssetTmpl, "||")[0] // 多候选取首候选验证
+		got := GitHubAssetURL(tool, tmpl, c.tag)
 		if got != c.want {
 			t.Errorf("%s URL is wrong:\n  got  %s\n  want %s", c.id, got, c.want)
 		}

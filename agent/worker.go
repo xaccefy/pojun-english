@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -226,6 +227,9 @@ func proxyEnv(proxyAddr, caCert string) []string {
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
 		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
+		// EGRESS_PROXY 给脚本/工具显式传参用（sqlmap --proxy、ffuf -proxy、
+		// nuclei -proxy 等对 env 支持不稳的工具直接从环境变量取）。
+		"EGRESS_PROXY=" + proxyAddr,
 	}
 	if caCert != "" {
 		env = append(env,
@@ -234,9 +238,60 @@ func proxyEnv(proxyAddr, caCert string) []string {
 			"REQUESTS_CA_BUNDLE="+caCert,
 			"GIT_SSL_CAINFO="+caCert,
 			"NODE_EXTRA_CA_CERTS="+caCert,
+			"EGRESS_PROXY_CA="+caCert,
 		)
 	}
 	return env
+}
+
+// proxyEnvKeys is every key proxyEnv writes. mergeProxyEnv must first strip same-named
+// variables from the parent process: under POSIX a duplicated env var resolves to the first
+// entry, so a plain append can leave the child still reading the host/service process's old
+// proxy values.
+var proxyEnvKeys = []string{
+	"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+	"ALL_PROXY", "all_proxy", "NODE_USE_ENV_PROXY",
+	"SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+	"GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS",
+	"EGRESS_PROXY", "EGRESS_PROXY_CA",
+}
+
+// mergeProxyEnv overlays the platform egress proxy onto base (usually os.Environ()). With an
+// empty proxyAddr it returns base unchanged — preserving the old "no proxy configured = direct,
+// don't touch the parent environment" semantics.
+func mergeProxyEnv(base []string, proxyAddr, caCert string) []string {
+	if proxyAddr == "" {
+		return base
+	}
+	drop := make(map[string]bool, len(proxyEnvKeys))
+	for _, k := range proxyEnvKeys {
+		drop[k] = true
+	}
+	out := make([]string, 0, len(base)+len(proxyEnvKeys))
+	for _, kv := range base {
+		if i := strings.IndexByte(kv, '='); i > 0 && drop[kv[:i]] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	extra := proxyEnv(proxyAddr, caCert)
+	if runtime.GOOS == "windows" {
+		// Windows env names are case-insensitive and exec dedups by name; pushing both
+		// HTTP_PROXY and http_proxy leaves only the last one alive. Keep the uppercase
+		// form only (Git Bash/MSYS maps it; Python/Node also read case-insensitively).
+		keep := extra[:0]
+		for _, kv := range extra {
+			if i := strings.IndexByte(kv, '='); i > 0 {
+				k := kv[:i]
+				if k != strings.ToUpper(k) {
+					continue
+				}
+			}
+			keep = append(keep, kv)
+		}
+		extra = keep
+	}
+	return append(out, extra...)
 }
 
 // workerDefaultTmpl is the built-in EDITABLE body (section [A]) of the worker system
@@ -323,13 +378,28 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
+// workerEgressBlock is the code-owned egress guardrail: Bash and the native tools already get the proxy
+// environment, but sqlmap/ffuf/nuclei and the like have unstable env support and must take the address
+// explicitly from EGRESS_PROXY.
+func workerEgressBlock(proxyAddr string) string {
+	if strings.TrimSpace(proxyAddr) == "" {
+		return ""
+	}
+	return "\n\n**Egress proxy (mandatory)**: this task's traffic all goes through " + proxyAddr + " (curl/python/git etc. inherit HTTP(S)_PROXY automatically; background job_start inherits it too). " +
+		"These tools have unstable env support and must take the proxy explicitly: sqlmap uses `--proxy=\"$EGRESS_PROXY\"`, " +
+		"ffuf uses `-proxy \"$EGRESS_PROXY\"`, nuclei uses `-proxy \"$EGRESS_PROXY\"`, " +
+		"httpx uses `-http-proxy \"$EGRESS_PROXY\"`, dalfox uses `--proxy \"$EGRESS_PROXY\"`. " +
+		"Do not bypass the egress with `--noproxy '*'`, `trust_env=False`, `proxies={}` and the like (it loses traffic evidence and exposes the real IP); " +
+		"if the egress is unreachable, check the pool with proxy_status / report the bad exit first. Use job_start for background work (Monitor doesn't inherit the proxy environment)."
+}
+
 func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
 	// Work hard-tails (v0.4.63): scanner-first + skill routing — code-injected, can't be edited away via the UI.
-	out := body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + scannerFirstGuidance + skillRoutingGuidance + execFaceWorkerGuidance +
+	out := body + workerTrafficBlock(caCert != "") + workerEgressBlock(proxyAddr) + workerArtifactSpec(runDir) + scannerFirstGuidance + skillRoutingGuidance + execFaceWorkerGuidance +
 		engagementFraming + impactVerificationGuidance
 	// Host-tool inventory: the worker is the one that actually acts, so the inventory must go into the worker's system prompt.
 	// It used to live only in the planner's wake prompt (for 'picking techniques when dispatching intents') — the worker couldn't
@@ -482,6 +552,7 @@ func firstCancel(cs []func(error)) func(error) {
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string, workCancel func(error)) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
+	tsx.SetEgressProxy(w.proxyAddr, w.proxyCACert) // native http_request/session_login share Bash's egress
 	tsx.SetScopeFlags(w.scopeGuard, w.scopeInheritWrites, w.crossTaskNotifyDedup)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)

@@ -162,6 +162,44 @@ func TestPassResetsCounters(t *testing.T) {
 	}
 }
 
+// 审计 F6：中流失败（部分输出已交付、无法转移）也要计入熔断记账——
+// 硬失败（401）中流出现时应立即 trip，而不是因为错过了转移窗口就免记账。
+func TestMidStreamFailureCountsTowardBreaker(t *testing.T) {
+	mid := &fakeProv{name: "mid", events: [][]llm.StreamEvent{
+		{{Type: llm.SETextDelta, Text: "partial"}},
+	}, errs: []error{fmt.Errorf("anthropic: status 401: bad key")}}
+	reg := NewRegistry(nil, nil)
+	p := New([]*Member{member(1, "mid", 10, mid)}, reg)
+
+	_, err := drain(p.Stream(context.Background(), llm.CompletionRequest{}))
+	if err == nil {
+		t.Fatal("中流错误应交付给调用方")
+	}
+	st := reg.Get(1)
+	if st.Trips != 1 {
+		t.Fatalf("中流硬失败应立即 trip：trips=%d fails=%d", st.Trips, st.Fails)
+	}
+	if !reg.IsOpen(1) {
+		t.Fatal("硬失败后熔断应打开")
+	}
+}
+
+// 审计 F5：非转移失败（400 确定性 4xx / ctx 取消）不清零累计失败计数。
+func TestCompleteNonFailoverKeepsFailCount(t *testing.T) {
+	bad := failProv("bad", 400) // 400 不转移
+	reg := NewRegistry(nil, nil)
+	reg.Restore(1, State{Fails: 2})
+	p := New([]*Member{member(1, "bad", 10, bad)}, reg)
+
+	_, _, _, err := p.Complete(context.Background(), llm.CompletionRequest{})
+	if err == nil {
+		t.Fatal("400 应原样返回错误")
+	}
+	if got := reg.Get(1).Fails; got != 2 {
+		t.Fatalf("非转移失败不应清零：fails=%d, want 2", got)
+	}
+}
+
 func TestBackoffLadderGrows(t *testing.T) {
 	reg := NewRegistry(nil, nil)
 	var prev time.Duration

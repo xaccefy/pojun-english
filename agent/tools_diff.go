@@ -642,7 +642,7 @@ func WriteDiffScript(dir string) (string, error) {
 
 // diffScriptSource is the diff script's source code (equivalent to the Go-side logic).
 const diffScriptSource = `#!/usr/bin/env python3
-"""Structured response diff (the executor side of the POJUN agent tool diff_responses).
+"""Structured response diff (the executor side of the agent tool diff_responses).
 
 Usage: resp_diff.py <fileA> <fileB> [statusA] [statusB]
 File contents are response bodies (or a curl -i full response — headers are stripped automatically); status codes optional.

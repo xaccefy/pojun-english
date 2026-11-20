@@ -1482,7 +1482,31 @@ esac
 
 if [ "$WITH_TOOLS" = "1" ]; then
   if [ "$IS_MAC" = "1" ]; then
-    warn "--with-tools is unavailable on macOS (the tool installer is apt/dnf-based); use brew install on demand"
+    # macOS: the apt/dnf stack is unavailable, so install the core pieces per-package,
+    # best-effort, via Homebrew (the pentest/GitHub tool groups are brew install on demand;
+    # packages that fail simply show as missing on the health page).
+    if ! command -v brew >/dev/null 2>&1; then
+      warn "Homebrew not detected — installing it first (may prompt for a password/Enter)..."
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+        || die "Homebrew install failed"
+      eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
+      eval "$(/usr/local/bin/brew shellenv 2>/dev/null || true)"
+    fi
+    BREW_PREFIX="$(brew --prefix)"
+    export PATH="$BREW_PREFIX/bin:$BREW_PREFIX/opt/postgresql@16/bin:$PATH"
+    info "Installing core dependencies via Homebrew (PostgreSQL/document rendering/pentest tool group, tolerant per package)..."
+    for pkg in postgresql@16 poppler imagemagick nmap masscan sqlmap hydra whatweb nikto \
+               gobuster ffuf john gitleaks dnsutils; do
+      brew list --formula 2>/dev/null | grep -q "^${pkg}@\|^${pkg}$" \
+        || brew install "$pkg" >/dev/null 2>&1 \
+        || warn "  brew missing package: $pkg"
+    done
+    # LibreOffice is a cask: after installing, symlink soffice into PATH so the report docx→PDF step finds it.
+    if [ ! -x "$BREW_PREFIX/bin/soffice" ] && [ -x "/Applications/LibreOffice.app/Contents/MacOS/soffice" ]; then
+      ln -sf "/Applications/LibreOffice.app/Contents/MacOS/soffice" "$BREW_PREFIX/bin/soffice"
+      ok "soffice symlinked → $BREW_PREFIX/bin/soffice"
+    fi
+    ok "macOS core install complete (brew install fills in other tools on demand)"
   else
     install_tools
   fi

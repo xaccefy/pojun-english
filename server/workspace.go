@@ -31,12 +31,12 @@ const (
 // these subdirs are in live use: deleting them either can't be regenerated or takes
 // forever to rebuild.
 //
-//	traffic          —— traffic-capture store (measured 3.3G / 340k rows). Deleting
+//	traffic          — traffic-capture store (measured 3.3G / 340k rows). Deleting
 //	                   loses every historical request/response and breaks the HTTP
 //	                   evidence chain in vuln reports.
-//	evidence         —— vuln-bound traffic bodies (blobs keyed by sha256). Deleting
+//	evidence         — vuln-bound traffic bodies (blobs keyed by sha256). Deleting
 //	                   turns every finding binding into a dangling pointer.
-//	nuclei-templates —— the vuln template library (measured 934M / 14077 templates).
+//	nuclei-templates — the vuln template library (measured 934M / 14077 templates).
 //	                   Deleting means a fresh git clone.
 //
 // Task data (tasks / sessions / transcripts) is deliberately **not** on this list: it
@@ -48,13 +48,57 @@ var workspaceProtectedDirs = []string{"traffic", "evidence", "nuclei-templates"}
 
 // wsProtected reports whether an absolute path is one of the protected system
 // directories (the directory itself, or anything under it).
+//
+// 判定必须基于**解析符号链接后的真实路径**：工作区里的 alias -> traffic
+// 词法上只是 data/alias，但实际写入会落进 traffic。只按词法前缀判断等于
+// 给符号链接留了一条写穿保护目录的路。
 func (s *Server) wsProtected(abs string) bool {
+	baseReal := filepath.Clean(s.m.dir)
+	if resolved, err := filepath.EvalSymlinks(baseReal); err == nil {
+		baseReal = filepath.Clean(resolved)
+	}
+	real, ok := evalExistingPath(abs)
+	if !ok {
+		// 无法解析（权限/异常路径）时保守拒绝，宁可挡住正常写入也不放行
+		// 一个无法证明安全的目标。
+		return true
+	}
 	for _, name := range workspaceProtectedDirs {
-		if pathWithin(filepath.Join(s.m.dir, name), abs) {
+		if pathWithin(filepath.Join(baseReal, name), real) {
 			return true
 		}
 	}
 	return false
+}
+
+// evalExistingPath resolves abs to its real path. The target itself may not
+// exist yet (write/mkdir/upload): resolve the nearest existing ancestor and
+// re-append the remaining suffix, so a symlinked parent still resolves to the
+// directory the OS will actually write into.
+func evalExistingPath(abs string) (string, bool) {
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), true
+	} else if !os.IsNotExist(err) {
+		return "", false
+	}
+	parent := filepath.Dir(abs)
+	for {
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			rel, err := filepath.Rel(parent, abs)
+			if err != nil {
+				return "", false
+			}
+			return filepath.Clean(filepath.Join(resolved, rel)), true
+		} else if !os.IsNotExist(err) {
+			return "", false
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", false
+		}
+		parent = next
+	}
 }
 
 // wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
@@ -343,6 +387,12 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 		destAbs, okd := s.wsResolve(filepath.Join(s.wsRel(dirAbs), name))
 		if !okd {
 			continue
+		}
+		// 目录本身可能安全，但同名文件可能是指向保护目录的符号链接；每个
+		// 最终目标都要按真实路径再检查一次。
+		if s.wsProtected(destAbs) {
+			writeErr(w, 403, "the system data directory is not writable ("+strings.Join(workspaceProtectedDirs, " / ")+")")
+			return
 		}
 		if err := saveUpload(hdr, destAbs); err != nil {
 			writeErr(w, 500, err.Error())

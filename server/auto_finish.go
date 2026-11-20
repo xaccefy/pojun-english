@@ -184,9 +184,10 @@ func (e *Engine) recordAndEvaluateAutoFinish(t *Task, round int64, triggers []ag
 }
 
 // maybePendingSettle executes a pending wrap-up inside plannerLoop. true means wrap-up
-// started. goal_met / auto_rounds may wrap with running intents (drain first);
-// idle/coverage are guaranteed active=false by the predicate — re-checked here against
-// concurrent intent additions.
+// started. goal_met requires "open+running intents = 0" (drain the frontier first);
+// auto_rounds is a hard round cap and may wrap with intents still open (settle drains
+// itself); idle/coverage are guaranteed active=false by the predicate — re-checked here
+// against concurrent intent additions.
 func (e *Engine) maybePendingSettle(ctx context.Context, t *Task) bool {
 	reason, detail := t.peekSettle()
 	if reason == "" {
@@ -200,7 +201,26 @@ func (e *Engine) maybePendingSettle(ctx context.Context, t *Task) bool {
 	}
 	if reason != "auto_rounds" {
 		active, err := t.Store.HasActiveIntent()
-		if err != nil || active {
+		if err != nil {
+			return false
+		}
+		if active {
+			log.Printf("[settle] task %s pending wrap-up (%s) waiting for running intents to finish", t.ID, reason)
+			return false
+		}
+	}
+	// goal_met 是 planner 基于「当时」的目标集下的判定，而新增目标先落库、再由
+	// NotifyGoal 追加内存触发，两者之间有窗口；按旧目标集收尾会把刚加的目标连同
+	// 任务一起终结（settleTaskWithReason 会用 taskGoalProgress 重算达成情况）。
+	// 这里以数据库为准复核一次：仍有 open 目标 → 撤销挂起收尾，交回规划轮重判。
+	if reason == "goal_met" {
+		open, err := t.Store.HasOpenGoal()
+		if err != nil {
+			return false // 读库失败：宁可不收尾，等下一次唤醒
+		}
+		if open {
+			t.clearSettle()
+			log.Printf("[settle] task %s goal_met wrap-up revoked: the goal set changed, unachieved goals remain", t.ID)
 			return false
 		}
 	}

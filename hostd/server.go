@@ -27,6 +27,7 @@ import (
 
 	"github.com/chu0119/pojun/hosttools"
 	"github.com/chu0119/pojun/proxyprobe"
+	"github.com/chu0119/pojun/selfupdate"
 )
 
 // State is a job state.
@@ -148,6 +149,13 @@ func newID() string {
 // parent must be a process-level ctx, never an HTTP request ctx (see the Server.base
 // comment).
 func (s *Server) Start(parent context.Context, toolID, proxy string) (*Job, error) {
+	return s.start(parent, toolID, proxy, InstallSources{})
+}
+
+func (s *Server) start(parent context.Context, toolID, proxy string, sources InstallSources) (*Job, error) {
+	if err := sources.Validate(); err != nil {
+		return nil, err
+	}
 	tool, ok := hosttools.Lookup(toolID)
 	if !ok {
 		return nil, fmt.Errorf("unknown tool id: %q (not on the whitelist)", toolID)
@@ -183,7 +191,7 @@ func (s *Server) Start(parent context.Context, toolID, proxy string) (*Job, erro
 			return
 		}
 		j.setState(StateRunning)
-		code, err := s.run(ctx, j, tool, cleanProxy)
+		code, err := s.run(ctx, j, tool, cleanProxy, sources)
 		j.mu.Lock()
 		j.ExitCode = code
 		j.EndedAt = time.Now()
@@ -243,14 +251,14 @@ func (s *Server) Cancel(id string) bool {
 // ── Execution ────────────────────────────────────
 
 // run executes the recipe and returns the exit code and error.
-func (s *Server) run(ctx context.Context, j *Job, tool hosttools.Tool, proxy string) (int, error) {
+func (s *Server) run(ctx context.Context, j *Job, tool hosttools.Tool, proxy string, sources InstallSources) (int, error) {
 	switch tool.Kind {
 	case hosttools.KindApt:
-		return s.runApt(ctx, j, tool, proxy)
+		return s.runApt(ctx, j, tool, proxy, sources.APT)
 	case hosttools.KindGitHub:
 		return s.runGitHub(ctx, j, tool, proxy)
 	case hosttools.KindPip:
-		return s.runPip(ctx, j, tool, proxy)
+		return s.runPip(ctx, j, tool, proxy, sources.PyPI)
 	case hosttools.KindScript:
 		// Every script-type install gets a uniform wall-clock timeout: the catalog scripts
 		// include GitHub/mirror downloads, and with a poor network window curl (which has no
@@ -294,26 +302,48 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (s *Server) runApt(ctx context.Context, j *Job, tool hosttools.Tool, proxy string) (int, error) {
+func (s *Server) runApt(ctx context.Context, j *Job, tool hosttools.Tool, proxy, preset string) (int, error) {
 	if s.pkgMgr == PkgNone {
 		return 1, fmt.Errorf("no apt/dnf detected on this host")
 	}
+	var sourceArgs []string
+	if s.pkgMgr == PkgApt && preset != "" {
+		args, cleanup, err := aptSourceArgs("/etc/apt", preset)
+		if err != nil {
+			return 1, fmt.Errorf("preparing the APT mirror: %w", err)
+		}
+		defer cleanup()
+		sourceArgs = args
+		j.append(fmt.Sprintf("[*] APT mirror: %s\n", preset))
+	}
 	// Refresh the index first; a failure is not fatal (it may just be an unreachable
 	// source), so keep trying the install
-	if code, err := s.execLogged(ctx, j, firstWord(aptUpdateArgv(s.pkgMgr, proxy)),
-		aptUpdateArgv(s.pkgMgr, proxy)[1:], []string{"DEBIAN_FRONTEND=noninteractive"}); err != nil {
+	update := aptUpdateArgv(s.pkgMgr, proxy)
+	updateArgs := update[1:]
+	if len(sourceArgs) > 0 {
+		// Keep the host's default index files available after this job.
+		updateArgs = append(updateArgs, "-o", "APT::Get::List-Cleanup=false")
+		updateArgs = append(updateArgs, sourceArgs...)
+	}
+	env := []string{"DEBIAN_FRONTEND=noninteractive"}
+	if code, err := s.execLogged(ctx, j, update[0], updateArgs, env); err != nil {
 		j.append(fmt.Sprintf("[warn] index refresh failed (exit code %d), continuing with the install\n", code))
 	}
 	argv, err := aptArgv(tool, s.pkgMgr, proxy)
 	if err != nil {
 		return 1, err
 	}
-	return s.execLogged(ctx, j, argv[0], argv[1:], []string{"DEBIAN_FRONTEND=noninteractive"})
+	return s.execLogged(ctx, j, argv[0], append(sourceArgs, argv[1:]...), env)
 }
 
-func (s *Server) runPip(ctx context.Context, j *Job, tool hosttools.Tool, proxy string) (int, error) {
+func (s *Server) runPip(ctx context.Context, j *Job, tool hosttools.Tool, proxy, preset string) (int, error) {
 	argv := pipArgv(tool, proxy)
-	code, err := s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+	env := proxyEnv(proxy)
+	if index := pypiIndex(preset); index != "" {
+		env = append(env, "PIP_INDEX_URL="+index)
+		j.append(fmt.Sprintf("[*] PyPI mirror: %s\n", preset))
+	}
+	code, err := s.execLogged(ctx, j, argv[0], argv[1:], env)
 	if err == nil {
 		return code, nil
 	}
@@ -331,14 +361,14 @@ func (s *Server) runPip(ctx context.Context, j *Job, tool hosttools.Tool, proxy 
 			return code, err
 		case <-time.After(time.Duration(attempt*5) * time.Second):
 		}
-		code, err = s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+		code, err = s.execLogged(ctx, j, argv[0], argv[1:], env)
 		if err == nil {
 			return code, nil
 		}
 	}
 	j.append("[warn] pip still failing, retrying with --ignore-installed\n")
 	argv = appendIgnoreInstalled(argv)
-	return s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+	return s.execLogged(ctx, j, argv[0], argv[1:], env)
 }
 
 // appendIgnoreInstalled inserts --ignore-installed after pip's install subcommand.
@@ -384,35 +414,54 @@ func (s *Server) runGitHub(ctx context.Context, j *Job, tool hosttools.Tool, pro
 	if err != nil {
 		return 1, fmt.Errorf("failed to resolve the latest version (configure an install proxy and retry): %w", err)
 	}
-	u := GitHubAssetURL(tool, tag)
-	j.append(fmt.Sprintf("[*] Downloading %s\n", u))
+	// The asset name supports "candidate1||candidate2": upstream asset naming shifts by version
+	// and architecture (feroxbuster ships arm64 as .zip only from v2.14), so each candidate is
+	// tried in turn on a 404.
+	var urls []string
+	for _, tmpl := range strings.Split(tool.AssetTmpl, "||") {
+		if tmpl = strings.TrimSpace(tmpl); tmpl != "" {
+			urls = append(urls, GitHubAssetURL(tool, tmpl, tag))
+		}
+	}
+	if len(urls) == 0 {
+		urls = []string{GitHubAssetURL(tool, tool.AssetTmpl, tag)}
+	}
 
 	var blob []byte
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		req.Header.Set("User-Agent", "pojun-hostd")
-		resp, err := client.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			blob, err = io.ReadAll(io.LimitReader(resp.Body, 128<<20))
-			resp.Body.Close()
-			if err == nil && len(blob) > 0 {
-				lastErr = nil
-				break
+	for _, u := range urls {
+		j.append(fmt.Sprintf("[*] Downloading %s\n", u))
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			req.Header.Set("User-Agent", "pojun-hostd")
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				blob, err = io.ReadAll(io.LimitReader(resp.Body, 128<<20))
+				resp.Body.Close()
+				if err == nil && len(blob) > 0 {
+					lastErr = nil
+					break
+				}
+			} else if err == nil {
+				err = fmt.Errorf("HTTP %d", resp.StatusCode)
+				resp.Body.Close()
 			}
-		} else if err == nil {
-			err = fmt.Errorf("HTTP %d", resp.StatusCode)
-			resp.Body.Close()
-		}
-		lastErr = err
-		if attempt < 3 {
-			j.append(fmt.Sprintf("[warn] download failed (%v), retrying in %d seconds…\n", err, attempt*2))
-			select {
-			case <-ctx.Done():
-				return 1, ctx.Err()
-			case <-time.After(time.Duration(attempt*2) * time.Second):
+			lastErr = err
+			if attempt < 3 {
+				j.append(fmt.Sprintf("[warn] download failed (%v), retrying in %d seconds…\n", err, attempt*2))
+				select {
+				case <-ctx.Done():
+					return 1, ctx.Err()
+				case <-time.After(time.Duration(attempt*2) * time.Second):
+				}
 			}
 		}
+		if len(blob) > 0 {
+			break // this candidate downloaded successfully
+		}
+		// every retry failed → move to the next candidate asset (on a 404 there is no point
+		// in another URL either, but the loop just ends)
 	}
 	if lastErr != nil {
 		return 1, fmt.Errorf("download failed: %w", lastErr)
@@ -586,13 +635,6 @@ func installFromZip(j *Job, zr *zip.Reader, tool hosttools.Tool) (int, error) {
 
 // ── Helpers ──────────────────────────────────────
 
-func firstWord(argv []string) string {
-	if len(argv) == 0 {
-		return ""
-	}
-	return argv[0]
-}
-
 // httpClient builds an HTTP client that goes through the proxy.
 //
 // socks5 must go through golang.org/x/net/proxy's SOCKS5 dialer: http.ProxyURL only
@@ -705,7 +747,7 @@ func (s *Server) Handler() http.Handler {
 	// knocks with its own version, and the helper replaces itself when it finds it is behind
 	// (see the UpgradeSelf comment: only the helper can do this).
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"service": "pojun-hostd", "version": s.Version})
+		writeJSON(w, 200, map[string]any{"service": "pojun-hostd", "version": s.Version, "install_sources": true})
 	})
 
 	mux.HandleFunc("POST /self-upgrade", func(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +761,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		if !ValidVersionTag(req.Tag) {
 			writeJSON(w, 400, map[string]any{"error": "invalid version format: " + req.Tag})
+			return
+		}
+		// Audit B9: reject downgrades. Installing a lower version is only allowed explicitly by
+		// re-running install.sh — the version-alignment request comes from the main program, which
+		// may itself have been manually downgraded/rolled back; dragging the helper down too would
+		// silently revert a known fix.
+		if cmp, comparable := selfupdate.CompareVersions(s.Version, req.Tag); comparable && cmp > 0 {
+			writeJSON(w, 400, map[string]any{"error": fmt.Sprintf("downgrade refused: helper is at %s, higher than the target %s; re-run install.sh to downgrade", s.Version, req.Tag)})
 			return
 		}
 		cleanProxy, err := ValidateProxy(req.Proxy)
@@ -751,22 +801,27 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"tools": hosttools.Inventory()})
 	})
 
-	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+	startJob := func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			ToolID string `json:"tool_id"`
-			Proxy  string `json:"proxy"`
+			ToolID  string         `json:"tool_id"`
+			Proxy   string         `json:"proxy"`
+			Sources InstallSources `json:"sources"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "request body is not valid JSON"})
 			return
 		}
-		job, err := s.Start(s.base, req.ToolID, req.Proxy)
+		job, err := s.start(s.base, req.ToolID, req.Proxy, req.Sources)
 		if err != nil {
 			writeJSON(w, 400, map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 201, job)
-	})
+	}
+	mux.HandleFunc("POST /jobs", startJob)
+	// With a selected mirror, old helpers must reject the job instead of silently
+	// ignoring the preset and downloading from the default source.
+	mux.HandleFunc("POST /jobs/with-sources", startJob)
 
 	mux.HandleFunc("GET /jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		job, ok := s.Get(r.PathValue("id"))

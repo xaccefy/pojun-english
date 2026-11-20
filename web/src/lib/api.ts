@@ -49,6 +49,7 @@ import type {
   FindingTraffic,
   FindingTrafficDetail,
   HostenvStatus,
+  HostInstallSources,
   InstallBatchResult,
   InstallJob,
   ProxyCheckResult,
@@ -111,6 +112,10 @@ import type {
   TrafficHost,
   TrafficResp,
   ProxyPoolState,
+  LocalProxyCandidate,
+  MihomoStatus,
+  ProxyPoolSubscription,
+  SSHProvider,
   C2Config,
   C2ConfigPatch,
   ConnectBack,
@@ -295,9 +300,28 @@ export const api = {
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  // First init must carry the contents of the server-side data/setup-token (audit B2: blocks public init squatting).
+  initPassword: async (password: string, setupToken?: string) => {
+    const headers: Record<string, string> = {};
+    if (setupToken) headers["X-Setup-Token"] = setupToken;
+    const token = getToken();
+    const r = await fetch("/api/auth/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ password }),
+    });
+    if (!r.ok) {
+      const message = await r.text().catch(() => "");
+      throw new Error(message || `Init failed: ${r.status}`);
+    }
+    return (await r.json()) as { token: string };
+  },
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+
+  // ---- session revocation (audit B1) ----
+  revokeAllSessions: () => post<{ ok: boolean; revoked_before: number }>("/sessions/revoke-all", { confirm: true }),
+  revokeCurrentSession: () => post<{ ok: boolean }>("/sessions/revoke-current", {}),
 
   // ---- tasks ----
   tasks: () =>
@@ -930,22 +954,139 @@ export const api = {
   proxyPoolPut: (payload: {
     entries: { url: string; name: string; enabled: boolean; weight: number }[];
     strategy: string;
+    enabled?: boolean;
+    strict?: boolean;
+    /** explicitly confirm clearing a non-empty pool (the backend's anti-wipe gate). */
+    confirm_clear?: boolean;
   }) => put<ProxyPoolState>(`/proxypool`, payload),
   // Bulk import: one proxy per line, auto-detecting host:port / http(s):// / socks5:// / host:port:user:pass
-  proxyPoolBulk: (payload: { text: string; mode?: "append" | "replace"; strategy?: string; weight?: number }) =>
+  proxyPoolBulk: (payload: {
+    text: string;
+    mode?: "append" | "replace";
+    strategy?: string;
+    weight?: number;
+    /** true by default: verify each line before import; unreachable ones are not imported. */
+    verify?: boolean;
+    verify_timeout_seconds?: number;
+    enabled?: boolean;
+  }) =>
     post<{
       ok: boolean;
       added: number;
       updated: number;
       total: number;
       invalid: { line: number; raw: string; reason: string }[];
+      rejected: { line: number; raw: string; reason: string }[];
+      /** existing entries disabled by this verification for being unreachable. */
+      disabled?: number;
+      verified?: boolean;
+      verify_skipped?: string;
     }>(`/proxypool/bulk`, payload),
   // Connectivity check: empty urls = every enabled entry
+  // Subscription pull (v0.7.3): extracts http/https/socks5 nodes; vmess and the like are only counted.
+  proxyPoolSubscriptionFetch: (url: string, includeYaml = true) =>
+    post<ProxyPoolSubscription>(`/proxypool/subscription/fetch`, {
+      url,
+      include_yaml: includeYaml,
+    }),
+  proxyPoolDetectLocal: (payload?: { ports?: number[]; target?: string; use?: boolean }) =>
+    post<{
+      ok: boolean;
+      target: string;
+      candidates: LocalProxyCandidate[];
+      added: number;
+    }>(`/proxypool/detect-local`, payload ?? {}),
+  proxyPoolMihomoStatus: () =>
+    get<{ ok: boolean; status: MihomoStatus; path: string }>(`/proxypool/mihomo`),
+  proxyPoolMihomoInstall: (payload?: {
+    proxy?: string;
+    url?: string;
+    sha256?: string;
+    path?: string;
+  }) =>
+    post<{
+      ok: boolean;
+      install: {
+        path: string;
+        version: string;
+        sha256: string;
+        source_url: string;
+        checksum_verified?: boolean;
+      };
+    }>(`/proxypool/mihomo/install`, {
+      proxy: payload?.proxy ?? "",
+      url: payload?.url ?? "",
+      sha256: payload?.sha256 ?? "",
+      path: payload?.path ?? "",
+    }),
+  proxyPoolMihomoStart: (payload: {
+    yaml?: string;
+    url?: string;
+    port?: number;
+    binary?: string;
+    outbound?: string;
+    /** group/node/load-balance/url-test/fallback (Clash node management page) */
+    mode?: string;
+    /** node names used for round-robin/delay-test/failover */
+    nodes?: string[];
+    use?: boolean;
+  }) =>
+    post<{
+      ok: boolean;
+      status: MihomoStatus;
+      proxy: string;
+      added: boolean;
+      note?: string;
+    }>(`/proxypool/mihomo/start`, payload),
+  proxyPoolMihomoStop: () =>
+    post<{ ok: boolean; removed: number }>(`/proxypool/mihomo/stop`, {}),
+  // Node delay test: via mihomo external-controller /proxies/{name}/delay.
+  proxyPoolMihomoDelays: (payload: {
+    names?: string[];
+    target?: string;
+    timeout_seconds?: number;
+  }) =>
+    post<{
+      target: string;
+      results: { name: string; delay_ms: number; error?: string }[];
+    }>(`/proxypool/mihomo/delays`, payload),
   proxyPoolCheck: (payload: { urls?: string[]; target?: string; timeout_seconds?: number; break_on_fail?: boolean }) =>
     post<{
       target: string;
       results: { index: number; url: string; ok: boolean; latency_ms: number; exit_ip?: string; error?: string; checked_at: string }[];
     }>(`/proxypool/check`, payload),
+  // ---- SSH jump hosts (v0.7.1) ----
+  sshProviders: () => get<{ providers: SSHProvider[] }>(`/egress/ssh`),
+  createSSHProvider: (payload: {
+    name?: string;
+    host: string;
+    port: number;
+    user: string;
+    auth_kind: "key" | "password";
+    secret: string;
+  }) => post<{ provider: SSHProvider }>(`/egress/ssh`, payload),
+  deleteSSHProvider: (id: number) => del<{ ok: boolean }>(`/egress/ssh/${id}`),
+  startSSHProvider: (id: number) => post<{ ok: boolean; socks_addr: string }>(`/egress/ssh/${id}/start`, {}),
+  stopSSHProvider: (id: number) => post<{ stopped: boolean }>(`/egress/ssh/${id}/stop`, {}),
+  useSSHProvider: (id: number) => post<{ ok: boolean; socks_addr: string }>(`/egress/ssh/${id}/use`, {}),
+  // Diagnostics bundle: downloads a zip (settings + runtime metrics + tasks/goals/intents + traces + log
+  // aggregation + traffic/proxy/LLM stats + integrity self-check). detail=true adds a larger window and
+  // worker trace summaries.
+  exportDiagnostics: async (opts?: { detail?: boolean }) => {
+    let blob: Blob;
+    if (MOCK) {
+      blob = new Blob(["(demo) diagnostics bundle content"], { type: "application/zip" });
+    } else {
+      const token = getToken();
+      const qs = opts?.detail ? "?detail=1" : "";
+      const r = await fetch(`/api/diagnostics/export${qs}`, {
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
+      if (!r.ok) throw new Error(`Failed to export the diagnostics bundle: ${r.status}`);
+      blob = await r.blob();
+    }
+    triggerBlobDownload(blob, `pojun-diagnostics-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}.zip`);
+  },
   vulnintelStatus: () => get<VulnIntelStatus>(`/vulnintel/status`),
   vulnintelSaveConfig: (payload: VulnIntelConfigPatch) => put<{ ok: boolean }>(`/vulnintel/config`, payload),
   vulnintelSyncNow: () => post<{ accepted: boolean }>(`/vulnintel/sync`, {}),
@@ -966,6 +1107,7 @@ export const api = {
     }>(`/tools/inventory`),
   // Host environment: health check (including one-click install availability) + one-click install (performed by the privileged helper pojun-hostd)
   hostenvStatus: () => get<HostenvStatus>(`/hostenv/status`),
+  hostenvSaveSources: (sources: HostInstallSources) => put<HostInstallSources>(`/hostenv/sources`, sources),
   hostenvInstall: (id: string) => post<InstallJob>(`/hostenv/install`, { id }),
   hostenvInstallBatch: (ids: string[]) => post<InstallBatchResult>(`/hostenv/install-batch`, { ids }),
   hostenvJob: (jobId: string) => get<InstallJob>(`/hostenv/jobs/${jobId}`),
@@ -1112,6 +1254,7 @@ export const api = {
     profile_id?: number,
     streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into a conversation
     session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
+    user_agent = "", // non-empty = the test request also sends this User-Agent (matching real runs)
   ) =>
     // reply = the model's actual reply (truncated); a profile that returns not a single word is judged a failure by the backend
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -1125,6 +1268,7 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      user_agent,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -1146,6 +1290,7 @@ export const api = {
     max_tokens?: number; // output cap per reply; 0 = do not send, let the server default decide
     max_tokens_field?: string; // ""=max_tokens (default) | "max_completion_tokens" (openai format only)
     session_header_key?: string; // non-empty = every request carries this HTTP header with the current conversation session id; "" = do not send
+    user_agent?: string; // User-Agent for LLM requests; "" = keep the SDK/Go default
     retry?: LLMRetryOverride; // this profile's retry overrides; leave every field 0 = follow the global retry policy
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
@@ -1157,13 +1302,14 @@ export const api = {
   // Global retry policy (attempts + interval for each of the five layers). All 0 = use the built-in defaults everywhere.
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
+  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number, user_agent = "") =>
     post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
       provider,
       base_url,
       api_key,
       proxy,
       profile_id,
+      user_agent,
     }),
 
   // ---- agents ----

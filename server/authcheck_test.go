@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func TestRunAuthCheck(t *testing.T) {
 		ContentType: "json", UsernameField: "user", PasswordField: "pass",
 		Username: "alice", Password: "s3cret", SuccessContains: "token",
 	}
-	res := runAuthCheck(base)
+	res := runAuthCheck(base, "", "")
 	if !res.OK || res.StatusCode != 200 {
 		t.Fatalf("json login should pass: %+v", res)
 	}
@@ -66,7 +67,7 @@ func TestRunAuthCheck(t *testing.T) {
 	// failing credentials: 401 + missing token → fail, and details carry no password.
 	bad := *base
 	bad.Password = "wrong-pass"
-	res = runAuthCheck(&bad)
+	res = runAuthCheck(&bad, "", "")
 	if res.OK {
 		t.Fatalf("bad credentials must fail: %+v", res)
 	}
@@ -77,15 +78,48 @@ func TestRunAuthCheck(t *testing.T) {
 	// form shape
 	form := *base
 	form.ContentType = "form"
-	res = runAuthCheck(&form)
+	res = runAuthCheck(&form, "", "")
 	if !res.OK || gotUser != "alice" || gotPass != "s3cret" {
 		t.Fatalf("form login should pass: %+v user=%s pass=%s", res, gotUser, gotPass)
 	}
 
 	// disabled: state it explicitly instead of misjudging as success.
 	off := db.TaskAuthConfig{}
-	if res := runAuthCheck(&off); res.OK {
+	if res := runAuthCheck(&off, "", ""); res.OK {
 		t.Fatal("disabled config must not report ok")
+	}
+}
+
+// TestRunAuthCheckUsesProxy 确认登录自检走平台出口代理，而不是从本机真实 IP
+// 直连目标：命中代理返回的响应才算数，目标服务器不应收到请求。
+func TestRunAuthCheckUsesProxy(t *testing.T) {
+	var directHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directHits++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"token":"direct"}`))
+	}))
+	defer target.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"token":"proxied"}`))
+	}))
+	defer proxy.Close()
+
+	cfg := &db.TaskAuthConfig{
+		Enabled: true, LoginURL: target.URL + "/login", Method: "POST",
+		ContentType: "json", UsernameField: "user", PasswordField: "pass",
+		Username: "alice", Password: "s3cret", SuccessContains: "token",
+	}
+	// host:port 形态：Manager.ProxyAddr 的两种写法都要能用（见
+	// TestProxyTransportAcceptsBothSpellings）。
+	res := runAuthCheck(cfg, strings.TrimPrefix(proxy.URL, "http://"), "")
+	if !res.OK {
+		t.Fatalf("proxy login should pass: %+v", res)
+	}
+	if directHits != 0 {
+		t.Fatalf("auth check dialed the target directly %d time(s)", directHits)
 	}
 }
 

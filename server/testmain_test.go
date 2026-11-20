@@ -13,6 +13,9 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	// 测试进程不启动漏洞情报同步 / nuclei 模板树：否则每个 NewManager 都会在
+	// 临时目录里克隆一份 1.4 万文件的模板树，清理不及就堆积成 GB 级垃圾。
+	vulnSyncDisabled = true
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

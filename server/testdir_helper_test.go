@@ -26,8 +26,16 @@ func testDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		time.Sleep(200 * time.Millisecond) // let async writers exit
-		_ = os.RemoveAll(dir)              // best-effort
+		// Retry with backoff for up to 30s: async writers plus a template tree of tens of thousands
+		// of small files — a single RemoveAll often doesn't delete it cleanly.
+		var last error
+		for i := 0; i < 120; i++ {
+			if last = os.RemoveAll(dir); last == nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		t.Logf("cleanup temp dir %s: %v", dir, last) // best-effort, but no longer silent
 	})
 	return dir
 }

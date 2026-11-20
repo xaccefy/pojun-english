@@ -1884,6 +1884,13 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	// User-Agent 是单行 HTTP 头值：含 CR/LF 会被 Go transport 拒绝（也是 header
+	// injection 的形状），在这里直接挡掉并给明确报错，别等运行时每个请求都失败。
+	p.UserAgent = strings.TrimSpace(p.UserAgent)
+	if strings.ContainsAny(p.UserAgent, "\r\n") {
+		writeErr(w, 400, "user_agent must not contain newlines")
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -2054,17 +2061,25 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		BaseURL   string `json:"base_url"`
 		APIKey    string `json:"api_key"`
 		Proxy     string `json:"proxy"`
+		UserAgent string `json:"user_agent"` // non-empty = the same UA as model requests; empty = the profile's stored value
 		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// Resolve API key: form input > profile stored key.
+	// Resolve API key: form input > profile stored key. UA 同样从 profile 兜底：
+	// 网关拦默认 UA 时，「加载模型」也应该和真实请求走同一套特征。
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
+	userAgent := strings.TrimSpace(req.UserAgent)
+	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if apiKey == "" {
+				apiKey = p.APIKey
+			}
+			if userAgent == "" {
+				userAgent = p.UserAgent
+			}
 		}
 	}
 	if apiKey == "" {
@@ -2140,6 +2155,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		httpReq.Header = c.hdr
+		if userAgent != "" {
+			httpReq.Header.Set("User-Agent", userAgent)
+		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			lastErr = "request failed: " + err.Error()

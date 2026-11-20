@@ -193,6 +193,12 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 		if err := s.engine.ControlWork(ctx, iid, "pause"); err != nil {
 			return out, err
 		}
+		// ControlWork 返回时意图已落库为 paused。若它是最后一条在跑意图，frontier
+		// 就此抽干——挂起的收尾（如 goal_met）需要一次唤醒才会被消费，否则要等
+		// 一个心跳周期。只在确有挂起收尾时唤醒，普通暂停不额外触发规划轮。
+		if reason, _ := t.peekSettle(); reason != "" {
+			t.Notify()
+		}
 		out.State = "paused"
 	case "resume":
 		if node.State != "paused" {

@@ -32,13 +32,13 @@ func TestJsAuditComposesCommand(t *testing.T) {
 	if out.Count != 2 {
 		t.Fatalf("count=%d want 2 (invalid URLs and dupes should be filtered)", out.Count)
 	}
-	if !strings.Contains(out.RunWithBash, "pojun-jsaudit.py") ||
+	if !strings.Contains(out.RunWithBash, "js_audit.py") ||
 		!strings.Contains(out.RunWithBash, "--out") ||
 		!strings.Contains(out.RunWithBash, "app.9f2c1d.js") {
 		t.Fatalf("command=%q", out.RunWithBash)
 	}
 	// the script lands and is valid python (py_compile verified externally in CI; here just non-empty).
-	p := filepath.Join(dir, "pojun-jsaudit.py")
+	p := filepath.Join(dir, jsAuditScriptName)
 	info, err := os.Stat(p)
 	if err != nil {
 		t.Fatalf("script missing: %v", err)

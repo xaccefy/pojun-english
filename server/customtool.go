@@ -461,7 +461,12 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	tr := s.httpProxyTransport(spec)
+	if tr == nil {
+		// 没有显式代理配置时走平台出口，而不是从平台真实 IP 直连目标。
+		tr = s.platformProxyTransport()
+	}
+	if tr != nil {
 		client.Transport = tr
 	}
 	resp, err := client.Do(req)
@@ -475,22 +480,45 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	return actool.Text(actool.Capture(tc, string(b))), nil
 }
 
-// httpProxyTransport builds a Transport for the http tool's proxy config, or nil
-// (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
-	proxyStr := strings.TrimSpace(spec.Proxy)
-	var caFile string
-	if spec.UseRecordingProxy {
-		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
-			caFile = s.m.ProxyCACert()
-		}
-	}
-	if proxyStr == "" {
+// platformProxyTransport returns the platform's default egress path: the
+// recording proxy while traffic capture is on, else the proxy pool or a
+// configured global proxy. Nil means no egress proxy is configured (direct) —
+// or the Server carries no manager (tests).
+func (s *Server) platformProxyTransport() *http.Transport {
+	if s.m == nil {
 		return nil
 	}
-	pu, err := url.Parse(proxyStr)
-	if err != nil {
+	return proxyTransport(s.m.ProxyAddr(), s.m.ProxyCACert())
+}
+
+// httpProxyTransport builds a Transport for the http tool's explicit proxy
+// config, or nil when the tool sets none. use_recording_proxy forces the
+// recording proxy (and trusts its CA); an explicit proxy URL is used as given.
+func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+	if spec.UseRecordingProxy && s.m != nil {
+		if addr := s.m.ProxyAddr(); addr != "" {
+			return proxyTransport(addr, s.m.ProxyCACert())
+		}
+	}
+	if p := strings.TrimSpace(spec.Proxy); p != "" {
+		return proxyTransport(p, "")
+	}
+	return nil
+}
+
+// proxyTransport routes requests through addr, accepting both "host:port" and
+// "scheme://host:port" spellings. caFile is trusted when the proxy re-signs TLS
+// (recording MITM). Nil when addr is empty or unusable.
+func proxyTransport(addr, caFile string) *http.Transport {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil
+	}
+	if !strings.Contains(addr, "://") {
+		addr = "http://" + addr
+	}
+	pu, err := url.Parse(addr)
+	if err != nil || pu.Host == "" {
 		return nil
 	}
 	tr := &http.Transport{Proxy: http.ProxyURL(pu)}

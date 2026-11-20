@@ -35,30 +35,96 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-const jsAuditScript = `#!/usr/bin/env python3
-"""pojun js_audit: SPA/webpack frontend source-leak audit.
+// jsAuditScriptName is the filename of the frontend source-audit script in the Agent work dir.
+const jsAuditScriptName = "js_audit.py"
 
-Usage: python3 pojun-jsaudit.py --out <outdir> <url1> [url2 ...]
+const jsAuditScript = `#!/usr/bin/env python3
+"""js_audit: SPA/webpack frontend source-leak audit.
+
+Usage: python3 js_audit.py --out <outdir> <url1> [url2 ...]
 url can be an entry HTML (extracts <script src>) or a .js file itself.
 Outputs one JSON event per line; final line type=summary. Stdlib only;
 http(s)_proxy env vars take effect automatically (traffic through the recording proxy); TLS verification off (like curl -k).
 """
-import sys, os, json, re, base64, ssl, urllib.request, urllib.parse
+import sys, os, json, re, base64, ssl, zlib, urllib.request, urllib.parse
 
 MAX_BYTES = 3_000_000
 MAX_MAP_BYTES = 12_000_000
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-      "Accept-Encoding": "identity"}
+# 目标侧身份：UA 与平台 http_request / poc_scaffold 逐字节一致（Windows x64 Chrome/131
+# 完整串），Accept 与 http_request 同为 */*；旧串缺 "(KHTML, like Gecko)"、版本只有两段，
+# 是全网唯一、可被目标侧跨请求关联的指纹。
+# Accept-Language / Accept-Encoding are ordinary browser headers, not identical to http_request's
+# set: http_request sends Accept-Language: en-US,en;q=0.9 and lets Go's transport add gzip for
+# Accept-Encoding, while here en-US plus gzip/deflate is spelled out for subresource fetches — a
+# deliberate trade-off that reduces the "same platform, different tool" distinguishability instead
+# of matching http_request byte for byte.
+# Accept-Encoding is scheme-independent: Chrome declares br/zstd on both http and https, but
+# stdlib can't decode them, so only gzip/deflate are declared and _decode really decompresses —
+# the residual difference exists on plaintext targets too, unrelated to TLS.
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept": "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate"}
 
 _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 _opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ctx))
 
+def _gunzip_all(raw, cap):
+    # gzip 响应允许由多个成员拼接：decompressobj 只解第一个成员，其余留在 unused_data 里。
+    # 逐个成员解到耗尽，输出有界（cap+1）；流未正常结束（如服务端只 flush 未 finish）时
+    # 返回已解出的部分，与单次 decompress 的行为一致。
+    out, rest = b"", raw
+    while True:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            out += d.decompress(rest, cap + 1 - len(out))
+        except zlib.error:
+            if out:
+                return out      # later member corrupt: keep the members already decoded, the first member is unaffected
+            raise
+        if len(out) > cap:
+            return out[:cap + 1]
+        if not d.eof or not d.unused_data:
+            return out
+        rest = d.unused_data
+
+def _decode(raw, enc, cap):
+    # 按 Content-Encoding 解压；解压后最多取 cap+1 字节（有界，防解压炸弹）。
+    # 只声明 gzip/deflate：多值（如 "gzip, br"）、未知编码或数据损坏都无法还原，
+    # 显式发 warn 事件再返回原始字节——不能让调用方把乱码当正文静默扫描。
+    enc = (enc or "").strip().lower()
+    if enc in ("", "identity"):
+        return raw
+    if enc in ("gzip", "x-gzip"):
+        cands = (16 + zlib.MAX_WBITS,)
+    elif enc == "deflate":
+        # zlib 头流与"裸"deflate 流都有服务器在用，依次回落
+        cands = (zlib.MAX_WBITS, -zlib.MAX_WBITS)
+    else:
+        cands = ()
+    for wb in cands:
+        try:
+            if wb > zlib.MAX_WBITS:
+                out = _gunzip_all(raw, cap)
+            else:
+                out = zlib.decompressobj(wb).decompress(raw, cap + 1)
+        except zlib.error:
+            continue
+        if len(out) > cap:
+            emit({"type": "warn", "where": "decode", "encoding": enc,
+                  "note": "decompressed body exceeds the read cap, truncated to %d bytes; later scan results may be incomplete" % cap})
+        return out
+    emit({"type": "warn", "where": "decode", "encoding": enc,
+          "note": "response body could not be decompressed (undeclared encoding or corrupt data); later scan results may be invalid"})
+    return raw
+
 def fetch(url, cap=MAX_BYTES):
     req = urllib.request.Request(url, headers=UA)
     with _opener.open(req, timeout=15) as r:
-        return r.getcode(), r.read(cap + 1), r.geturl()
+        raw = r.read(cap + 1)
+        return r.getcode(), _decode(raw, r.headers.get("Content-Encoding"), cap), r.geturl()
 
 def emit(obj):
     print(json.dumps(obj, ensure_ascii=False))
@@ -185,7 +251,7 @@ def analyze_map(raw, js_url, map_url, outdir, tag):
         pass
     emit({"type": "sourcemap", "found": True, "js": js_url, "map_url": map_url, **info,
           "dir": os.path.join(outdir, tag),
-          "note": "CWE-540 source leak: sourcesContent IS the original source; .vue/.env counts above.
+          "note": "CWE-540 source leak: sourcesContent IS the original source; .vue/.env counts above. "
                   "A real key → critical; structure-only leak → high (L3)"})
     n = secret_scan(raw.decode("utf-8", "replace"), "map:" + map_url)
     return True, n
@@ -312,10 +378,8 @@ func (t *ToolSet) ensureJsAuditScript() string {
 	if strings.TrimSpace(t.runDir) == "" {
 		return ""
 	}
-	p := filepath.Join(t.runDir, "pojun-jsaudit.py")
-	if _, err := os.Stat(p); err == nil {
-		return p
-	}
+	// 每次覆盖写，不复用既有同名文件（理由同 ensureProbeScript）。
+	p := filepath.Join(t.runDir, jsAuditScriptName)
 	if err := os.WriteFile(p, []byte(jsAuditScript), 0o755); err != nil {
 		return ""
 	}
@@ -372,7 +436,7 @@ func (t *ToolSet) jsAudit() actool.CoreTool {
 			return jsonResult(map[string]any{
 				"run_with_bash": fmt.Sprintf("python3 %s --out %s %s", script, out, strings.Join(quoted, " ")),
 				"count":         len(urls),
-				"note": "output is one JSON event per line (html/js/sourcemap/secrets/endpoints/summary). " +
+				"note": "output is one JSON event per line (html/js/sourcemap/secrets/endpoints/warn/summary). " +
 					"sourcemap found=true → CWE-540: restored source lands in the --out dir; save_evidence then report high; " +
 					"real credentials in secrets → critical; endpoints get record_fact'd and continue per api-security-testing.",
 			})

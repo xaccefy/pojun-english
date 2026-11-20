@@ -4,6 +4,521 @@ All notable changes to this project are recorded in this file, following the for
 
 ## [Unreleased]
 
+## [0.4.89] - 2026-11-19
+### Security (audit fix batch two: B1 short-term mitigation + B8/B9 + F5/F6 + issue #21.2)
+
+- **B1 session revocation**: JWTs are issued with a `jti` (16 random bytes); added "revoke all
+  sessions" (a settings sentinel timestamp — every token with an iat before it dies, including
+  historical tokens without a jti) and "revoke the current session" (expires exactly that jti,
+  leaving other devices alone). The only way to kick a session used to be changing the password
+  to rotate the key. The check hangs on requireAuth, refreshed from settings in a 30s-TTL memory
+  cache, and write endpoints update it eagerly; a settings read failure keeps the old value and
+  lets the request through (fail-open — the defense-in-depth layer never blocks normal traffic).
+  Old tokens (no jti) can't be revoked individually and are covered by the sentinel.
+- **B1 admin-side second confirmation**: revoking all sessions requires an explicit
+  `{"confirm":true}` body, 400 without it; the frontend sidebar gained a red "Revoke all
+  sessions" menu item plus an AlertDialog confirmation, and on success drops the local token and
+  goes to the login page. The same-second boundary fails closed (tokens issued at the revoke
+  instant and within that second die; signing in again restores access).
+- **B9 hostd refuses downgrades**: the helper's `/self-upgrade` now 400s when the target tag is
+  below the current version (before, only the format was checked and any valid tag re-dressed
+  it); the main program's version-reconcile loop skips and suggests rerunning install.sh when the
+  helper is newer than itself — after a manual main-program rollback the helper is no longer
+  dragged back too, silently reverting a known fix.
+- **B8 mandatory sha256 for mihomo remote-URL installs**: no http(s) install source may rely on
+  "install first, compare the hash by hand" any more — a poisoned binary has already run once by
+  then. A missing sha256 is refused outright (the frontend input is required in step); offline
+  cases use "install from a server file" (the operator's local file is controllable, so it stays
+  optional); the official+mirror path already carried a forced GitHub-API hash check and is
+  unaffected.
+- **F5 non-failover failures no longer reset the llm pool**: `Complete`'s non-failover errors (ctx
+  cancellation / deterministic 4xx) used to call `Pass()` and wash away the accumulated failure
+  count — a bad config that hit 401 every time could never build up a trip count. Now the error
+  is delivered and the tally is left in place, aligned with Stream's non-failover path.
+- **F6 mid-stream failures count as a Trip in the llm pool**: a failure partway through a streamed
+  response (some content already delivered, no failover possible) previously recorded nothing and
+  bad nodes never accumulated breaker counts; failover-eligible mid-stream failures now `Trip` as
+  usual (ctx cancellation is the caller stopping its read and doesn't count).
+- **issue #21.2 script body visibility**: the review input (ReviewInput v5) gained a `scripts`
+  field — local script files referenced by the tool command (the first non-option argument after
+  the interpreter / a token carrying a script extension) have a body snapshot read out and
+  attached to the fallback Judge, so a command like `python3 shared/scripts/exp.py` no longer
+  leaves the review layer with just a file name. Limits: at most 4 files, 32KB per file / 128KB
+  total; regular files only (devices/pipes/directories are skipped so a PreToolUse can't hang);
+  dynamic paths containing variables/globs go into `unresolved_scripts` and the Judge treats them
+  conservatively as invisible-content. The Judge prompt is updated to match.
+
+### Tests
+
+- `server/auth_revoke_test.go`: jti uniqueness, revoke-all (400 without confirm / old tokens and
+  historical jti-less tokens die / a new token in a later second survives), revoke-current
+  (expires exactly, no collateral).
+- `hostd/server_test.go`: a downgrade tag 400s, an upgrade tag passes.
+- `mihomo/install_sources_test.go`: a URL install without sha256 is refused and leaves no binary.
+- `llmpool/pool_test.go`: a mid-stream hard failure trips at once, non-failover `Complete`
+  failures don't reset the count.
+- `intercept/review_context_test.go`: script body injection (static extraction / dynamic path as
+  unresolved / non-regular files skipped).
+
+## [0.4.88] - 2026-11-19
+### Changes
+
+- **Egress proxy env var renamed `POJUN_PROXY` → `EGRESS_PROXY`** (alongside PR #37's
+  de-branding): the proxy variables the agent injects into Bash, the prompts and the skills'
+  hand-written command templates all follow. Scripts already on disk can keep the old name until
+  regenerated; standard variables such as `HTTP(S)_PROXY`/`ALL_PROXY` are unaffected.
+
+### Fixes
+
+- **js_audit target-side request headers align with the platform default**: the embedded script's
+  User-Agent went from a malformed string missing `(KHTML, like Gecko)` with a two-part version to
+  the full Windows x64 Chrome/131 string, byte-identical to `http_request` / `poc_scaffold`, plus
+  `Accept` / `Accept-Language`; it declares `Accept-Encoding: gzip, deflate` and really decompresses
+  per `Content-Encoding` (gzip, zlib-header deflate, raw-deflate fallback), emitting a `warn` event
+  on multi-value/unknown encodings or decompression failure (returning the part already decoded when
+  the stream is cut) instead of silently scanning mojibake as a body. The old UA was unique network-wide
+  and could be correlated across requests by the target side.
+
+### Fixes
+
+- **Remove product identifiers that reach the target side** (PR #37): the PoC scaffold template,
+  scripts written to disk and code-built prompt text carried the platform name. Those strings land
+  on the pentested party with the request or the write — SSRF parameter values, the upload
+  request's multipart boundary, file bodies written to the target's disk, test-object names written
+  into the customer's business database, script file names in the agent work dir. A client-side blue
+  team takes them for the attacker's signature and produces false IoCs pointing at this product,
+  misleading incident response.
+  - `poc_scaffold`: de-branded the SSRF canary, the multipart boundary and the upload shell
+    response; dropped `pojun` from the JWT weak-secret list (it isn't a common weak secret), 9
+    candidates become 8
+  - `verification_depth` built-in prompt text: the marker written into target test objects changed
+    from `pojun-test-*` to `qa-test-*`; the prefix still works for enumerating cleanup
+  - scripts written to disk: `pojun-probe.sh` → `probe.sh`, `pojun-jsaudit.py` → `js_audit.py`,
+    script headers and the cookie-jar comment de-branded too
+  - `enrich`: de-branded the UA used to probe target sites
+- **Scripts on disk are overwritten on every call** (PR #37): with the product name gone from the
+  file names, a model-created file of the same name in the same work dir could collide — every call
+  now writes the platform script back over it.
+- **New regression assertions** (PR #37) `agent/target_identity_test.go`: assert that the PoC
+  template, scripts, system prompts and skills scripts contain no platform/capability identifier.
+- **The custom http tool and the task login self-check now use the platform egress**: both used a
+  bare `http.Client` to reach the target straight from the platform's real IP, bypassing the
+  recording proxy and the egress pool; with `use_recording_proxy` ticked they even double-prefixed
+  an already-schemed proxy address into `http://http://…` and broke. Now:
+  - the custom http tool defaults to `Manager.ProxyAddr()` when no `proxy` is configured
+    (capture on = recording proxy and the MITM CA trusted; otherwise = egress pool/global proxy;
+    under strict egress a failure stays a failure), and an explicit `proxy` still overrides;
+  - the task login self-check uses the platform egress too;
+  - proxy addresses accept both `host:port` and `scheme://host:port`.
+- **`scan_with_nuclei` always emits the egress proxy**: `ToolSet.egressProxy` flows through
+  `ScanArgs.Proxy` into `vulnintel.BuildNucleiCmd`, which appends `-proxy <url>` (two separate argv
+  elements, still single-quoted per argument): a bare `host:port` gets `http://` added, an
+  already-schemed value passes through as-is (including the strict-egress sentinel
+  `http://127.0.0.1:1`), an empty proxy emits nothing, a comma errors out (`-proxy` is `string[]`
+  and a comma would be split into a broken multi-proxy), and a missing port errors too (nuclei
+  probes host:port at startup and FATALs without one). Previously this rested on the worker prompt
+  alone, which the model could skip. (The `server`-level `buildDomainReg` registry doesn't inject
+  `egressProxy` — a known gap, see `docs/proxy-and-egress-chain.md`.)
+- **Prompts drop nuclei's nonexistent `-random-agent`**: v3.11.1 has neither that flag nor
+  `-user-agent`, so copying the example always failed; the text also states that
+  `scan_with_nuclei` adds `-proxy` itself and only hand-written commands need it. Touches
+  `agent/ops_tails.go`, `skills/component-vuln-intel/SKILL.md` and `skills/src-hunting/references/`
+  (the hand-written commands in `recon-methodology` and `subdomain-takeover-test` use
+  `${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}`, which emits no empty `-proxy` when no proxy is set).
+- With an egress proxy configured the tool note gains a troubleshooting line first (under `-silent`
+  empty output ≠ no hits), separated from the body by a space.
+- The GNU `timeout` wrapper's seconds now derive from `TimeoutTotal` (sharing
+  `vulnintel.EffectiveTimeout`'s 0→10m / >30m→30m clamp with `BuildNucleiCmd`) instead of a
+  hard-coded 600.
+
+### Tests
+
+- `vulnintel/nuclei_test.go`: `TestNormalizeNucleiProxy` (including a missing port),
+  `TestEffectiveTimeout`, `TestBuildNucleiCmdProxy` (including the CVE/severity + `-proxy`
+  combination and exactly one `-proxy`).
+- `agent/tools_vulnintel_test.go`: `TestNucleiScanArgsCarriesEgressProxy`, `TestNucleiBashCommand`
+  (computes the `timeout` prefix from the actual environment, including the 10m/30m second
+  derivation and the `-proxy` combination), `TestNucleiEgressNote`.
+- `agent/prompt_tails_test.go`: the worker prompt contains no `-random-agent` and does contain
+  `-proxy` and the auto-injection note.
+
+## [0.4.87] - 2026-11-19
+
+### Fixes (audit fix batch v0.4.87: 7 P1/P2 items, see docs/audit-remediation-plan-v0.4.87.md)
+
+- **B2/P2 auth/init squatting window**: after a public deployment and before an admin finishes
+  /setup, an unauthenticated party could race POST /api/auth/init to set its own password and take
+  over the instance. The server now generates a one-time setup token for an uninitialized instance
+  (`data/setup-token`, 0600, also printed to the startup log) and init must carry the
+  `X-Setup-Token` header; the file is deleted on success; instances with a password set are
+  unaffected. The /setup page gained a token input.
+- **B3/P2 no request-body cap on authenticated endpoints**: the 30+ handlers that bypass the
+  unified decode() and hit NewDecoder directly are now covered by a global
+  `limitRequestBody(32MB)` (413 past it); the two upload endpoints with their own larger caps
+  (workspace 512MB / chat 128MB) are explicitly exempt.
+- **B4/P2 mihomo subscriptions could inject listeners**: a malicious subscription could inject a
+  `listen: 0.0.0.0` socks listener and open an unauthenticated public proxy. writeConfig now
+  deletes the whole `listeners` key.
+- **F1/P2 auth_index out of step with list_assets order**: parseAuthEntries used to drop empty
+  entries and reorder tokens first, so the credential the model picked by list_assets differed
+  from the one actually sent. It now matches the DB array in length and order, invalid entries hold
+  a placeholder and session_login/auth_request report them explicitly with the valid indices;
+  auth_request without an index picks the first valid credential.
+- **F2/P2 task delete/archive cascade gaps**: hard delete and archive now clean intercept_pending,
+  task_progress, credentials and credential_access_log — approval badges no longer linger forever
+  and sensitive credentials (password/key ciphertext) don't outlive the authorization window
+  (archive clears them; re-enter after restore).
+- **F3/P2 job_start orphans on same-name concurrency**: concurrent starts under the same name let
+  the earlier process escape the ledger and keep hitting the target after a pause. job_start is
+  serialized under a write lock end to end (low start rate, no perceived cost); a later start
+  under the same name kills the previous job first. New 8-concurrent, no-orphan test.
+- **F4/P2 poc_scaffold cmdi criterion regex double escaping**: `r"uid=\d+\("` matched a literal
+  backslash in Python and could never hit `uid=0(root)` — a false negative in the Linux
+  command-injection verification skeleton. Corrected to `r"uid=\d+\("`.
+- The diagnostics bundle, settings page and the whole proxy chain are regression-unaffected.
+
+## [0.4.86] - 2026-11-18
+
+### Added (PR #32, thanks @Conly-Zy)
+
+- **Optional mirrors for host-tool install sources**: "System → Host environment → Install
+  sources" offers system default, Tencent Cloud and Tsinghua TUNA for APT / PyPI each; saving
+  applies to newly created single installs and to "install all":
+  - APT uses a temporary source directory for that job only (distribution, architecture,
+    signatures and third-party repos preserved), never touching the host's `/etc/apt` files;
+  - a PyPI mirror becomes the primary index for pip / pipx; picking "system default" restores the
+    old behavior;
+  - the helper (hostd) accepts preset IDs only, never arbitrary URLs; an older helper answers a
+    mirror job with an explicit error (upgrade the helper or restore default sources) rather than
+    silently using the defaults.
+  - a manual Git clone address generator is also provided: GitHub origin / `gh-proxy.cn` (public
+    repositories only).
+
+### Fixes / wording (PR #31, thanks @Conly-Zy)
+
+- **Version-update proxy wording**: "Version and update" now states that checking and downloading
+  a GitHub Release prefers the install proxy (host environment → install sources/proxy) and only
+  uses the global proxy when none is configured, dropping the misleading "configure the global
+  proxy" hint on failure; it also notes that under Docker bridge networking `127.0.0.1` points at
+  the container itself.
+- The global-proxy copy now says where update traffic actually goes.
+
+### CI
+
+- **Go module download retry**: ci/release run `go mod download` before `go build`, with up to 4
+  backoff retries. A single transient module-proxy stream error used to redden the whole Release
+  (v0.4.84 was that, unpublished).
+
+## [0.4.85] - 2026-11-18
+
+### Fixes
+
+- **Proxy URL masking in the diagnostics bundle**: `user:pass` in `global_proxy` /
+  `web_search_proxy` / `install_proxy` and in proxy-pool entries is replaced with `***` before
+  export. Users often forward the bundle to a developer, and the platform's own proxy credentials
+  shouldn't ride along (target data stays as-is).
+
+## [0.4.84] - 2026-11-18
+
+### Added: diagnostics bundle export (ported from the internal red-team build)
+
+- **System settings → Diagnostics and troubleshooting → Export diagnostics bundle (zip)**: one
+  file answering "why did the task stop, why did the intent burn, where is the worker stuck, what
+  is flooding the log, did the finding land" — without server access when a user reports an issue.
+- The bundle carries: process/database metadata, settings, the engine runtime snapshot, every task
+  field (goal/intent/finding counts and recent activity), target detail, intent detail
+  (blocked_reason/stop_reason/writeback and tool-error counts), finding metadata (without
+  evidence/report bodies), fact summaries, tool activity, the event timeline, LLM usage and
+  profile health, traffic statistics (by host/status code/failing host, no bodies), proxy-pool
+  runtime state, layered logs (error clustering + warn/info sampling + level counts) and a
+  data-integrity self-check (table row counts/schema columns).
+- The "include detailed execution traces" switch (`?detail=1`) widens the trace/log windows; the
+  bundle can reach 50MB.
+- The log foundation is upgraded too: `server_logs` is pruned hourly (7 days / max 1M rows kept);
+  panic storms are folded by "first-line signature + minute window" (max 5 per signature, counted)
+  so one repeated panic can't flood the bundle.
+- The bundle is read-only and carries no LLM/proxy credentials, traffic bodies or evidence bodies.
+
+### Improved: system settings page layout (internal-edition style)
+
+- The header is unified through `PageHeader` (title + description); the multi-column masonry cards
+  became a **two-column equal-height grid** grouped as "Version and update / Network and traffic /
+  Execution and concurrency / Model and context / Features and preferences / System maintenance",
+  each heading on its own row; card content stretches to align and wide cards span both columns.
+- New "Diagnostics and troubleshooting" card (detailed-trace switch + export button).
+
+## [0.4.83] - 2026-11-18
+
+### Added: the full proxy chain (ported from the internal red-team build)
+
+- **Clash / mihomo core management**: new "System → Clash node management" page. Supports
+  subscription pulls (Clash YAML / URI / base64, with SSRF defense), node grouping, one-click core
+  install (official GitHub source + mirror acceleration + custom URL / local file / PATH — four
+  routes, SHA256 verification, resumable downloads), start/stop, five exit modes (fixed group/fixed
+  node/load balance/url-test/fallback) and node delay tests. The core listens on a loopback
+  mixed-port only, and the external-controller gets a random secret per start.
+- **Proxy pool upgrade**: the pool now applies with traffic capture off too (pinning one exit for
+  the whole task), while with capture on it still serves as the MITM upstream rotating per
+  request; added a master switch, pre-import verification, bulk selection, trip state persisted
+  across restarts, health checks auto-restarting a local mihomo, and automatic discovery/takeover
+  of a local Clash port.
+- **Strict egress (UI switch, off by default)**: with a pool configured but fully tripped, target
+  requests fail outright (sentinel address 127.0.0.1:1) instead of falling back to direct and
+  exposing the real IP; a separate "direct but still recording" fallback switch (off by default)
+  trades IP hiding for evidence continuity when explicitly enabled.
+- **SSH jump-host egress**: new "System → SSH jump hosts" page. Register a jump host (password/key
+  stored in the credential vault under XChaCha20-Poly1305, the API returns only a credential_id),
+  start a minimal local SOCKS5 and set it as a pool exit in one click; it coexists with Clash
+  nodes.
+- **Egress hints and explicit passing**: the worker prompt gained an egress guardrail —
+  sqlmap/ffuf/nuclei/httpx/dalfox and other tools with flaky env support must take the proxy
+  explicitly from `POJUN_PROXY`; `--noproxy '*'`, `trust_env=False` and similar bypasses are
+  forbidden; background jobs use `job_start` (Monitor doesn't inherit the proxy environment).
+
+### Fixes: target traffic leaking past the proxy
+
+- **Native `http_request` / `session_login` went direct**: `SetEgressProxy` used to be dead code
+  (defined, never called), so the native tools fell back to the service process environment,
+  reached targets directly and left nothing in the MITM. worker/planner/mainagent now inject the
+  same egress proxy and CA as Bash when building the ToolSet.
+- **`job_start` background jobs went direct**: the job environment only took `os.Environ()` and
+  didn't inherit the task's egress proxy. `mergeProxyEnv` now strips leftover parent proxy
+  variables and injects the platform egress; on Windows only uppercase keys survive under the
+  case-insensitive rule, so exec dedup can't drop the proxy.
+- **Docker/host proxy variables interfering**: same-named parent variables are stripped before
+  merging, so POSIX's "duplicate variable resolves to the first" can't leave the child reading an
+  old proxy.
+
+## [0.4.82] - 2026-11-18
+
+### Added (issue #24, second item: session_login trip on consecutive failures)
+
+- **Pre-registered credential login breaker**: after a password expired or was rotated, several
+  workers would each retry the same pre-registered credential and easily trip the target's account
+  lockout policy — locking out the customer's test or production account. The Go execution layer
+  now trips deterministically:
+  - covers 【pre-registered credentials】 only (registered on an asset and referenced via
+    `asset_id + auth_index`); one-off credentials typed by the model are excluded.
+  - only 401/403 count as a failure (explicit auth rejection); 2xx clears the count; other status
+    codes are neutral — a flaky target or a malformed model argument can't inflate the count.
+  - 2 consecutive 401/403 → tripped for 30 minutes: meanwhile a `session_login` on that credential
+    is 【refused locally with no network request】; on expiry one half-open attempt passes, success
+    resets, failure trips again (covering the case where the target unlocked but the credential
+    is unchanged).
+  - a credential change (operator rotates the password/token on the asset) hashes differently and
+    resets the breaker automatically;
+  - when not tripped but counting, the tool result carries a remaining-attempts hint steering the
+    model to another `auth_index` or to unauthenticated surface.
+  - transport errors (connect failure/proxy fault) don't count — that's an egress problem, check
+    `proxy_status` first.
+- The multi-role credential pool (the issue's first item) is still scheduled P2; the breaker is an
+  independently shippable guardrail.
+
+## [0.4.81] - 2026-11-17
+
+### Added (PR #26, thanks @FldBudin)
+
+- **Intercept rules gained an optional applies-to tool scope (`tool_scope`)**: when a rule's match
+  target is `tool_input`, the engine matches against the whole raw JSON of the tool arguments
+  without telling tools apart. The same string is data in a write-file tool's body and a command
+  only in a shell tool's `command`; a pure regex can't tell, tool identity is the unambiguous
+  signal. The new `tool_scope` filters by tool before matching: an empty array = any tool (the
+  default, existing rules unchanged), non-empty = only the listed tools; it ANDs with the global
+  `intercept_enabled_tools`; `match_target=tool_name` rules reject a non-empty scope (matching by
+  tool name and then restricting the list would give "who it applies to" two truths). Rules
+  excluded by the scope take no part in matching or the allow short-circuit.
+
+  Known residual: a heredoc write still carries the body inside the `command` string, and the tool
+  dimension can't remove false positives on that path; keyword rules should switch to the `judge`
+  action and let the model decide from the full arguments whether it is a command or written text.
+  Adapting the built-in rules scope by scope is left for a later pass.
+
+### Fixes (PR #27 / #28 / #30, thanks @FldBudin)
+
+- **Wrap up immediately once every goal is met (#27)**: the goal_met branch cancelled the running
+  workers first and checked the exec ctx after, so the wrap-up record was unreachable and the task
+  idled a whole heartbeat interval (600s default) before ending. The `goal_met` wrap-up is now
+  recorded before cancelling, a cancelled worker wakes the planner after its writeback, the goal
+  set is re-checked against the database before consuming the wrap-up (new goals aren't ended by a
+  stale verdict), and a pending wrap-up is also consumed after pausing and resuming a single
+  intent.
+- **A task with every goal met lands done (#28)**: `settleTerminalStatus`'s
+  `reason=timeout && !finalRoundMet` guard also applied to tasks with goals — when every goal had
+  been proven met by prove_goal the final round had nothing left to prove and returned met=false,
+  and the task was misjudged timeout. Now: with goals, the database's achievement state decides
+  (all met → done); goal-less tasks keep the final-round verdict. Only one cell of the 16-cell
+  truth table changes.
+- **go.mod marks logrus as a direct dependency (#30, issue #29)**: `traffic/traffic.go` imports
+  and calls logrus directly but it sat in the indirect block, so any `go mod tidy` produced
+  unrelated diff. Moved to the direct block; `go.sum` and versions unchanged.
+
+## [0.4.80] - 2026-11-17
+
+### Fixes (issue #17 / #18 / #20 / #21.3 / #22)
+
+- **Workspace symlinks could bypass protected directories (#17)**: `wsProtected` judged by lexical
+  path, so after `data/alias -> data/traffic` a write to `alias/...` landed in traffic. It now
+  judges by the real path after `EvalSymlinks` (resolving the nearest existing parent when the
+  target doesn't exist), upload re-checks every final file, and write/mkdir/upload/delete are all
+  covered; new regression test.
+- **Pause racing job_start missed kills (#18)**: `job_start` started the process and wrote
+  metadata after, and the pause sweep scanned once, so in-flight jobs could be missed. An in-process
+  job-lifecycle read/write lock was added: `job_start` holds the read lock across
+  "start + register", `KillJobsForTaskDir` holds the write lock until registration finishes before
+  scanning; `job_start` checks the exec context before starting and kills the process group at once
+  on a metadata write failure. New deterministic concurrency test.
+- **Capability goals could be bypassed by a plain fact in prove_goal (#20)**: when a goal demands a
+  capability result such as RCE/command execution/control/sensitive data, only high/critical
+  findings are accepted as evidence; facts and low/medium findings are refused.
+  "Exists/triage" existence goals are unaffected. New unit and PostgreSQL integration tests.
+- **ExecuteExtraTool bypassed per-tool intercept rules (#21.3)**: the guard unpacks norma's
+  `tool_name` + `params` in the Pre/Post hooks so rule matching, the Judge and the audit all see
+  the real inner tool; a command of an inner Bash can be hit by rules too. Two new end-to-end tests.
+- **Stall timing and deadline budget drift after pause/resume (#22)**: added `tasks.paused_at`;
+  resume pushes `deadline_at` out by the pause duration; `Engine.Resume` clears the autopilot
+  baseline so the pause isn't misread as "no progress" and stall_nudge doesn't misfire.
+
+## [0.4.79] - 2026-11-17
+
+### Fixes (thanks to @FldBudin's PR #19)
+
+- **Location keys no longer act as finding identity, so different findings on one asset aren't
+  merged**: when the first URL in the evidence was the asset base, different findings on the same
+  asset (IDOR, auth bypass, info disclosure, SSRF) all hit the same `endpoint:<host>/` strong key
+  and merged into one finding, a later report overwriting an earlier one (measured: 4 vuln classes
+  left only the last SSRF report).
+  - `endpoint` / `param` drop from strong to weak keys (rank 99), used only for `merge_candidates`
+    hints and no longer in automatic merging; a bare asset base generates no endpoint key;
+  - the merge query explicitly excludes `endpoint` / `param` so a future rank change can't let a
+    location key through again;
+  - URL extraction gains full-width/half-width punctuation exclusion and fails closed when parsing
+    fails, instead of falling back to junk keys;
+  - `report_finding` gained an optional `root_cause_key`, turning "merge the same root cause across
+    endpoints" into an explicit declaration (generic words/too-short values are refused), replacing
+    the guesswork merge on location;
+  - repeated reports with the same `fingerprint` or `root_cause_key` still merge as before; no
+    historical migration — records already merged stay as they are.
+
+## [0.4.78] - 2026-11-16
+
+### Fixes (security, thanks to @FldBudin's PR #15)
+
+- **A top-level DSL OR wasn't grouped, defeating the task scope**: with OR in the DSL,
+  `list_assets` and `GET /api/assets?dsl=` had the caller's appended `AND type/task_ids/scope`
+  constrained by SQL operator precedence to the last OR branch only, and could return other
+  tasks' assets (measured: task A's `url=profile OR url=token OR url=register` found 6 of task B's
+  assets). `buildDSLWhereBase` now wraps the whole predicate in parentheses before returning, so it
+  is a self-contained boolean group; OR-less queries are semantically unchanged. New builder-level
+  and real-PostgreSQL regression tests covering all three callers `CountDSL` / `QueryDSL` /
+  `QueryDSLInScope`.
+
+## [0.4.77] - 2026-11-16
+
+### Improved (issue #13 follow-up)
+
+- **The LLM UA templates now cover mainstream coding tools**: v0.4.76 only shipped browser UAs, but
+  a coding agent's UA is a different shape — `tool/version (platform; arch) terminal` or
+  `tool/version sdk/... runtime/...`, and many gateways that allow-list by client type only accept
+  those prefixes. 10 templates added:
+  - Claude Code: `claude-cli/2.1.63 (external, cli)`
+  - Codex CLI (macOS / Windows templates): `codex_cli_rs/0.144.6 (...) ...`
+  - Gemini CLI: `GeminiCLI/0.46.0/gemini-3-pro-preview (linux; x64; cli)`
+  - OpenCode: `opencode/1.18.29 ai-sdk/... runtime/bun/...`
+  - Zed: `Zed/0.219.4+stable.119.0 (macos; aarch64)`
+  - GitHub Copilot CLI / Copilot Chat (VS Code)
+  - Roo Code / Kilo Code
+  Template values come from real captures and upstream source; version and terminal bits are
+  editable right in the input. The settings dropdown groups them as "coding tools / browsers". Only
+  the User-Agent is covered; if a gateway also checks companion headers or auth, configure those
+  separately as it requires.
+
+## [0.4.76] - 2026-11-16
+
+### Added (issue #13)
+
+- **The User-Agent of LLM requests is configurable**: model configs gained a `user_agent` field.
+  The UA used to be decided inside the SDK (norma), the client always sent
+  `Go-http-client/1.1`, and some gateways / WAFs reject that outright (403s, connection resets)
+  with nothing the platform could do — only a SDK change. Every LLM config can now set its own UA:
+  - the settings page ships 7 mainstream browser templates (Chrome · Windows / macOS / Android,
+    Safari · macOS / iPhone, Edge · Windows, Firefox · Windows); picking one fills it in and it
+    stays editable; empty = no override, keeping the SDK default, old configs unchanged.
+  - the injection point is the agent's shared RoundTripper, so **every model request from connect
+    retries and empty-response retries carries it**; "test connection" and "load models" use the
+    same UA, so the "test passes, task runs 403" gap can't appear.
+  - it applies to all Agents immediately on save with no restart; it only affects outbound LLM
+    requests, never any request to a pentest target (the target-side UA uses v0.4.74's
+    `http_request.user_agent`).
+  - the server rejects a UA containing CR/LF (header injection defense); the DB column is an
+    idempotent migration backfilled automatically on startup of an old database.
+
+### Fixes
+
+- **Wrong Release-notes extraction (affecting the v0.4.73–v0.4.75 pages)**: the workflow extracted
+  the version section with `awk '$0 ~ "## [x.y.z]"'`; the brackets were read as a regex character
+  class, the real heading never matched, the appendix line `## 0.4.4 – 0.4.19` did, and the Release
+  page pasted the full old table. Switched to literal prefix matching with `index()`, and a missing
+  version section now fails outright instead of publishing a Release with empty notes.
+
+## [0.4.75] - 2026-11-16
+
+### Fixes
+
+- **feroxbuster arm64 download 404**: from v2.14 upstream ships an arm64 asset as `.zip` only. The
+  asset template supports `||` candidates (zip first, the next candidate on a 404), and the
+  table-driven installs in hostd and install.sh support it too.
+- **setup-postgres.sh hardening** (PR #11 follow-up): the dsn mode refuses a "fake completion" path;
+  single quotes are escaped before SQL concatenation.
+
+## [0.4.74] - 2026-11-16
+
+### Added (issue #13)
+
+- **http_request / session_login accept a custom User-Agent**: an explicit `user_agent` argument
+  (optional) overrides the default Chrome/131 Windows UA — for fingerprint evasion, mobile
+  impersonation and reproducing a specific client's behavior. `session_login` can also pass a UA
+  through the `header` argument; `headers` overrides it too (both noted in the schema description).
+
+
+## [0.4.73] - 2026-11-16
+
+> macOS adaptation completed (feedback from real Apple Silicon use) + DeepSeek configuration docs. The closing pass of the install-form work.
+
+### Fixes
+
+- **The Docker image's pojun-hostd lacked the exec bit**: the chmod missed the hostd added in
+  v0.4.69, so "host environment" one-click installs and the first-boot catalog preinstall were
+  skipped wholesale in the container (Apple Silicon user: 36/90) — restoring it brings hostd
+  startup and the preinstall chain back.
+- **The preinstall-complete marker moved to the container layer**: the marker used to live on the
+  persistent data volume, so after an image upgrade rebuilt the container "the tools are gone but
+  the marker stays" → preinstall skipped forever, tools silently gone. The marker now follows the
+  container lifecycle and a rebuild reruns it (preinstall is idempotent).
+- **kerbrute / waybackurls arm64**: upstream ships no linux/arm64 asset — the Dockerfile gained a
+  golang build stage compiling on the spot (incremental under QEMU is manageable), covering both
+  for arm64 Docker users.
+- **netexec arm64**: it depends on aardwolf, which needs a newer Rust than Debian bookworm's
+  rustc — the catalog entry's Install hint gained a rustup recipe note (no silent failure).
+
+### Added
+
+- **docker-compose.macos.yml**: macOS data volume switched to a named volume (bind mounts go
+  through VirtioFS/gRPC-FUSE, an order of magnitude slower on small-file I/O — and traffic/evidence
+  are small-file heavy), callback ports 4444-4450 pre-mapped, with a manual LHOST (host LAN IP)
+  note.
+- **install.sh --with-tools macOS branch**: Homebrew detection/install + core dependencies
+  per-package tolerant (PostgreSQL 16/poppler/imagemagick/pentest tools) + automatic soffice
+  symlink into PATH after the LibreOffice cask install — no longer silently skipped.
+- README quick start gained the macOS Docker command; the deployment manual gained a macOS Docker
+  deployment section (manual LHOST callback recipe: `ipconfig getifaddr en0` + 1:1 port mapping).
+
+### Notes
+
+- LLM: DeepSeek is an OpenAI-compatible endpoint and works right in the LLM config page (base_url
+  `https://api.deepseek.com` + deepseek-chat/deepseek-reasoner); the README gained an example, and
+  multi-channel rotation/breaker/failover work for DeepSeek too.
+
+
 ### Fixes (community feedback)
 
 - **#8 idle-stop same-turn concurrency escalation ended**: when a single assistant turn issues multiple tool_use calls concurrently,

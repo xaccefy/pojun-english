@@ -5,6 +5,7 @@ import * as React from "react";
 import { CpuIcon, FlaskConicalIcon, GaugeIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon, TimerResetIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -34,6 +35,9 @@ export default function SystemSettingsPage() {
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
+  // diagnostics bundle export
+  const [diagDetail, setDiagDetail] = React.useState(false);
+  const [exportingDiag, setExportingDiag] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [savingKey, setSavingKey] = React.useState(false);
   const [pyInterp, setPyInterp] = React.useState("");
@@ -393,21 +397,40 @@ export default function SystemSettingsPage() {
   // brave-free selected but no key stored and none being entered → tool stays off.
   const braveNeedsKey = webSearch && backend === "brave-free" && !braveKeySet;
 
+  async function exportDiagnostics() {
+    if (exportingDiag) return;
+    setExportingDiag(true);
+    try {
+      await api.exportDiagnostics({ detail: diagDetail });
+      toast.success("Diagnostics bundle download started");
+    } catch (e) {
+      toast.error(`Export failed: ${(e as Error).message}`);
+    } finally {
+      setExportingDiag(false);
+    }
+  }
+
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
-      <div>
-        <h1 className="font-semibold text-xl tracking-tight">System Settings</h1>
-        <p className="text-muted-foreground text-sm">Global runtime switches</p>
-      </div>
+      <PageHeader
+        title="System settings"
+        description="Global runtime switches: updates, execution concurrency, autopilot bounds, network and traffic, model context and maintenance. Per-task overrides live in the task detail."
+      />
 
-      {/* Multiple columns instead of grid: the web search card is several times taller than the rest, and its height varies with the selected backend (brave/tavily
-          key inputs are conditionally rendered). A grid would stretch the whole row to the tallest card, leaving large blank spaces beside it,
-          while multiple columns balance fill by content height automatically. Card spacing uses mb rather than gap — in a multi-column layout
-          column-gap only governs spacing between columns, so row spacing must be provided by the children themselves. */}
-      <div className="columns-1 gap-4 md:gap-6 lg:columns-2">
-        <UpdateCard />
+      {/* Two-column grid + section headings (internal-edition style): cards are grouped by meaning with
+          equal heights per row; each heading is itself a col-span-2 grid item, so it always starts a new block. */}
+      <div className="grid grid-cols-1 items-stretch gap-4 md:gap-6 lg:grid-cols-2 [&_[data-slot=card]]:h-full [&_[data-slot=card-content]]:flex-1">
+        <div className="order-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">Version and update</div>
+        <div className="order-2 lg:col-span-2 [&_[data-slot=card]]:h-full">
+          <UpdateCard />
+        </div>
+        <div className="order-12 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">Network and traffic</div>
+        <div className="order-20 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">Execution and concurrency</div>
+        <div className="order-30 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">Model and context</div>
+        <div className="order-40 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">Features and preferences</div>
+        <div className="order-50 text-xs font-semibold uppercase tracking-wider text-muted-foreground lg:col-span-2">System maintenance</div>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-13">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
@@ -434,7 +457,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-14">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
@@ -462,7 +485,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-15">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
@@ -474,6 +497,7 @@ export default function SystemSettingsPage() {
               <br />
               When <b>Traffic Capture</b> is enabled, it acts as the <b>upstream</b> of the recording proxy (traffic is still fully recorded, then exits through this proxy); when capture is off, it is injected directly into
               Agents' bash / WebFetch for egress. Independent of the web search proxy and the LLM proxy.
+              Checking and downloading program updates prefers the host environment's "install proxy" and only uses the global proxy when none is configured.
               <br />
               <b>Tip</b>: with capture <b>off</b>, socks5 relies on each command-line tool's support for <code>ALL_PROXY</code> (curl
               works, some tools may ignore it); if you mainly use socks5, it is recommended to enable Traffic Capture — on this path the MITM
@@ -503,7 +527,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-21">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <ShieldAlertIcon className="size-4" />
@@ -543,7 +567,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-31">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <FlaskConicalIcon className="size-4" />
@@ -571,7 +595,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-41">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <SearchIcon className="size-4" />
@@ -757,7 +781,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-42">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
@@ -787,7 +811,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-22">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <CpuIcon className="size-4" />
@@ -816,7 +840,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-23">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <TimerResetIcon className="size-4" />
@@ -899,7 +923,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-24">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <GaugeIcon className="size-4" />
@@ -947,7 +971,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-32">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <CpuIcon className="size-4" />
@@ -1041,7 +1065,7 @@ export default function SystemSettingsPage() {
           </CardContent>
         </Card>
 
-        <Card className="mb-4 break-inside-avoid md:mb-6">
+        <Card className="order-43">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <KeyboardIcon className="size-4" />
@@ -1069,6 +1093,36 @@ export default function SystemSettingsPage() {
                 ))}
               </SelectContent>
             </Select>
+          </CardContent>
+        </Card>
+
+        <Card className="order-51">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <SearchIcon className="size-4" />
+              Diagnostics and troubleshooting
+            </CardTitle>
+            <CardDescription>
+              Export a diagnostics bundle: settings, runtime metrics, tasks/goals/intents, execution traces,
+              findings/facts, the event timeline, layered logs (panic aggregation), traffic/proxy/LLM statistics
+              and a data-integrity self-check, packed into one zip. When something breaks, send that file to a
+              developer to locate it without server access (no LLM/proxy credentials, traffic or evidence bodies).
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-1 flex-col justify-center gap-4">
+            <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+              <div className="min-w-0">
+                <div className="text-sm">Include detailed execution traces</div>
+                <div className="text-muted-foreground text-xs">
+                  Carries worker step-by-step tool traces (arguments reduced to shape summaries, no command/traffic
+                  bodies) and a larger log window; can reach 50MB.
+                </div>
+              </div>
+              <Switch checked={diagDetail} onCheckedChange={setDiagDetail} disabled={exportingDiag} />
+            </div>
+            <Button size="sm" variant="outline" onClick={exportDiagnostics} disabled={!loaded || exportingDiag}>
+              {exportingDiag ? "Exporting…" : "Export diagnostics bundle (zip)"}
+            </Button>
           </CardContent>
         </Card>
       </div>

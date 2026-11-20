@@ -21,7 +21,16 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import {
@@ -73,6 +82,108 @@ const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: "high", label: "high" },
   { value: "xhigh", label: "xhigh" },
   { value: "max", label: "max" },
+];
+
+// Common templates for the LLM request UA. Picking a template only fills the full UA into the input;
+// you can still edit it afterwards. Browser UAs and coding-tool (CLI/IDE) UAs are two completely
+// different fingerprints: the latter usually look like `tool/version (platform; arch) terminal` or
+// `tool/version sdk/... runtime/...`, and many gateways that allow-list by client type only accept
+// those prefixes. Version/terminal bits in a template can be edited freely.
+const CUSTOM_UA = "custom";
+const UA_TOOL_PRESETS: { value: string; label: string; ua: string }[] = [
+  {
+    value: "claude-code",
+    label: "Claude Code · CLI",
+    ua: "claude-cli/2.1.63 (external, cli)",
+  },
+  {
+    value: "codex-mac",
+    label: "Codex CLI · macOS",
+    ua: "codex_cli_rs/0.144.6 (Mac OS 15.6.1; arm64) ghostty/1.3.0",
+  },
+  {
+    value: "codex-win",
+    label: "Codex CLI · Windows",
+    ua: "codex_cli_rs/0.144.6 (Windows 11 24H2; x86_64) vscode/1.105.1",
+  },
+  {
+    value: "gemini-cli",
+    label: "Gemini CLI",
+    ua: "GeminiCLI/0.46.0/gemini-3-pro-preview (linux; x64; cli)",
+  },
+  {
+    value: "opencode",
+    label: "OpenCode",
+    ua: "opencode/1.18.29 ai-sdk/openai-compatible/2.0.41 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.15",
+  },
+  {
+    value: "zed",
+    label: "Zed · AI",
+    ua: "Zed/0.219.4+stable.119.0 (macos; aarch64)",
+  },
+  {
+    value: "copilot-cli",
+    label: "GitHub Copilot CLI",
+    ua: "copilot/1.0.25 (client/sdk win32 v22.19.0) term/unknown",
+  },
+  {
+    value: "copilot-vscode",
+    label: "GitHub Copilot Chat · VS Code",
+    ua: "GitHubCopilotChat/0.37.2026011603",
+  },
+  {
+    value: "roo-code",
+    label: "Roo Code",
+    ua: "roo-code/3.45.0 (darwin 25.2.0; arm64) node/22.21.1",
+  },
+  {
+    value: "kilo-code",
+    label: "Kilo Code",
+    ua: "kilo-code/5.1.0 (darwin 25.2.0; arm64) node/22.21.1",
+  },
+];
+const UA_BROWSER_PRESETS: { value: string; label: string; ua: string }[] = [
+  {
+    value: "chrome-win",
+    label: "Chrome · Windows",
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  },
+  {
+    value: "chrome-mac",
+    label: "Chrome · macOS",
+    ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  },
+  {
+    value: "chrome-android",
+    label: "Chrome · Android",
+    ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+  },
+  {
+    value: "safari-mac",
+    label: "Safari · macOS",
+    ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+  },
+  {
+    value: "safari-iphone",
+    label: "Safari · iPhone",
+    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+  },
+  {
+    value: "edge-win",
+    label: "Edge · Windows",
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+  },
+  {
+    value: "firefox-win",
+    label: "Firefox · Windows",
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+  },
+];
+// The first item has ua="" = no override, keeping the SDK/Go default (Go-http-client/1.1).
+const UA_PRESETS = [
+  { value: NONE, label: "No override (default Go UA)", ua: "" },
+  ...UA_TOOL_PRESETS,
+  ...UA_BROWSER_PRESETS,
 ];
 
 function cooldownText(secs: number) {
@@ -338,6 +449,7 @@ function ProfileSheet({
   const [maxTokens, setMaxTokens] = React.useState("0"); // output cap per reply; 0 = do not send
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // which field name for the cap; NONE = max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // custom session header name; empty = do not send
+  const [userAgent, setUserAgent] = React.useState(""); // LLM request UA; empty = keep the SDK/Go default
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // retry override for this profile; all 0 = follow global
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -365,6 +477,7 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setUserAgent(profile?.user_agent ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -373,13 +486,15 @@ function ProfileSheet({
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+  // Show the template when the current UA matches one exactly, otherwise show "custom".
+  const uaPresetValue = UA_PRESETS.find((p) => p.ua === userAgent)?.value ?? CUSTOM_UA;
 
   async function loadModels() {
     if (loadingModels) return;
     setLoadingModels(true);
     setModels([]);
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId, userAgent.trim());
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
@@ -411,6 +526,7 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        userAgent.trim(),
       );
       // Show the reply content too: only when you can see the model actually spoke does it count as working the same as in a conversation.
       if (r.ok)
@@ -454,6 +570,7 @@ function ProfileSheet({
         // the back end also performs the same normalization, here we just avoid the UI sending self-contradictory values.
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        user_agent: userAgent.trim(),
         retry,
       });
       if (isNew) toast.success(`Created: ${name.trim()} (click "Set as active" on the card to enable)`);
@@ -475,6 +592,7 @@ function ProfileSheet({
           Number(id),
           streaming,
           sessionHeaderKey.trim(),
+          userAgent.trim(),
         );
         if (!t.ok) {
           toast.error(
@@ -628,6 +746,59 @@ function ProfileSheet({
               Once a header name is filled in, every request includes this HTTP header, with its value automatically set to the <b>current session's session id</b> (chat sessions such as
               conv-12, workers such as exp3-worker-i87). For gateways that do prompt caching /
               sticky routing based on a session-id header; stable across turns of the same session, distinct across different sessions. Leave empty to not send it.
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-user-agent">User-Agent for LLM requests (optional)</Label>
+            <Select
+              value={uaPresetValue}
+              onValueChange={(v) => {
+                const preset = UA_PRESETS.find((p) => p.value === v);
+                if (preset) setUserAgent(preset.ua); // "custom" only switches the display, it does not change the input
+              }}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Pick a common UA template" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>No override (default Go UA)</SelectItem>
+                <SelectSeparator />
+                <SelectGroup>
+                  <SelectLabel>Coding tools (CLI / IDE)</SelectLabel>
+                  {UA_TOOL_PRESETS.map((p) => (
+                    <SelectItem key={p.value} value={p.value}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+                <SelectSeparator />
+                <SelectGroup>
+                  <SelectLabel>Browsers</SelectLabel>
+                  {UA_BROWSER_PRESETS.map((p) => (
+                    <SelectItem key={p.value} value={p.value}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+                <SelectSeparator />
+                <SelectItem value={CUSTOM_UA}>Custom (type it below)</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              id="p-user-agent"
+              className="font-mono text-xs"
+              placeholder="Leave empty to keep the SDK default (Go-http-client/1.1)"
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              When non-empty, replaces the User-Agent on <b>every LLM request</b> (retries included). Some
+              gateways / WAFs reject the default Go UA outright (403s, connection resets) — picking a template
+              is enough. For gateways that allow-list by client type (Claude Code / Codex / Gemini CLI /
+              OpenCode etc.) choose the "Coding tools" group; version and terminal bits stay editable. It only
+              affects outbound LLM requests, never any request to a pentest target. A few gateways also check
+              companion request headers or auth (changing the UA alone may not pass their subscription check).
             </p>
           </div>
 

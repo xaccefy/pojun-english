@@ -31,9 +31,10 @@ There is also a separate, non-disableable layer of **soft protection**: `guard.p
 
 ## 2. Rule engine: priority, three actions, matching
 
-Rules live in `intercept_rules` (schema.sql:1033-1051); `Interceptor.Match` (`intercept/intercept.go:508`) takes the **first** matching enabled rule in **priority DESC** order and then stops evaluating lower-priority rules (this is exactly the point of allow: a high-priority allow exempts a pile of denies below it).
+Rules live in `intercept_rules` (db/schema.sql:1080-1101); `Interceptor.Match` (`intercept/intercept.go:694`) takes the **first** matching enabled rule in **priority DESC** order and then stops evaluating lower-priority rules (this is exactly the point of allow: a high-priority allow exempts a pile of denies below it).
 
 - **Match subject**, one of two: `tool_name` (the tool name) or `tool_input` (the full input JSON text).
+- **Rule-level applies-to tools** `tool_scope` (optional, a JSON string array): when non-empty this rule only applies to the listed tools; an empty array = any tool (the default, behavior identical to before the column existed). It only means something for the `tool_input` subject — that matches the whole input JSON, the same string is data in a write-file tool's body and a command only in a command field, a pure regex can't tell, and tool identity is the unambiguous signal. It **ANDs** with the global `intercept_enabled_tools`: the global decides "which tools enter the rule system", the rule decides "which of those this rule applies to" — it can only narrow, never widen; rules excluded by the scope take no part in matching or the allow short-circuit. A `match_target=tool_name` rule carrying a non-empty scope is rejected by the API (matching by tool name and then restricting the tool list would give "who it applies to" two truths).
 - **Match method**, one of two: `string` (substring containment, case-sensitive) or `regex` (silently skipped if compilation fails, so a bad rule cannot bring down the whole call, `intercept.go:176-179`).
 - **Three actions**:
   - `allow`: allow immediately and write a **decided** audit row (status=allowed), making the explicit approval visible on the history page (`intercept.go:567`);
@@ -42,6 +43,10 @@ Rules live in `intercept_rules` (schema.sql:1033-1051); `Interceptor.Match` (`in
 - **Tool scope**: only tools inside the `intercept_enabled_tools` setting enter the rule system (default set: Bash/WebFetch/web_search/shell_open/shell_send/Write/Edit/MultiEdit, `intercept.go:143`). Any rule CRUD/toggle calls `Invalidate()` on the in-memory cache, which reloads on the next call.
 
 A rule's own timeout policy (`timeout_enabled/timeout_seconds/timeout_action`) caps the ask wait; asks produced by the fallback judge use the separate ask timeout in the judge config.
+
+### Known residual: shell heredoc bodies
+
+Restricting rules to shell tools doesn't remove every false positive: writing a file with a heredoc such as `cat > report.md <<'EOF' … EOF` puts the body inside the `command` string, and the tool dimension can't tell "command" from "written body"; pure RE2 can't parse heredocs reliably either (`<<-` dedent, quoted delimiters, several on one line, nesting, inline `bash -c` scripts). For such keyword rules, lower the action to `judge` — the model sees both the tool name and the full arguments and can decide from context whether it is a command or text.
 
 ## 3. The pending approval flow
 

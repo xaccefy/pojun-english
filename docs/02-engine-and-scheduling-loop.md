@@ -134,7 +134,7 @@ flowchart TB
   D -->|timeout| E["hard cancel(AbortSettleDrainTimeout)<br/>settle-aware branch classifies as exhausted"]
   D -->|drained| F["⑤ one final planner round<br/>(own ctx, not interrupted by pause/cancel,<br/>Final injects the task-timeout wrap-up wording, only judges goals, dispatches no intents)"]
   E --> F
-  F --> G["⑥ SetTaskStatusGuarded sets the terminal state<br/>met→done / otherwise timeout (first terminal writer wins)"]
+  F --> G["⑥ SetTaskStatusGuarded sets the terminal state<br/>all goals met→done / an unachieved goal→timeout<br/>goal-less tasks from the final-round met verdict (first terminal writer wins)"]
 ```
 
 Run-level and task-level wall clocks are clamped by `clampMaxDuration` (`agent/taskclock.go`): a worker's MaxDuration is min(its own budget, time left to the deadline); when it fires, the SDK interrupts the running tool and settles in place (the `Settlement` hint asks it to write back what it has identified first and then summarise in one sentence, `agent/worker.go:154`) — an abandoned run doesn't lose facts. The revival path from timeout back to running is cleaned of old state by `resetTimeoutRevival` (`server/engine_timeout.go:87`).
@@ -155,7 +155,8 @@ Timeout is not the only exit. After every regular planning round (`runRound` in 
 4. the settle action is **not executed inside runRound**: it only records `task.pendingSettleReason`,
    and plannerLoop calls `settleTaskWithReason` after this round's inflight is released (so the settle's
    own drain doesn't count itself and wait 5 minutes for nothing).
-5. settling always lands on `done` (timeout keeps `met?done:timeout`), with the reason written into activity;
+5. the settle terminal state follows goal achievement: every goal `met` → `done`, any unachieved goal →
+   `timeout` (goal-less tasks are decided by the final planner round), with the reason written into activity;
    the final planner uses `plannerAutoFinishDefault` (not the timeout wording).
 
 Global settings (the system settings page's "task auto-finish"): `auto_finish_enabled` (on by default),

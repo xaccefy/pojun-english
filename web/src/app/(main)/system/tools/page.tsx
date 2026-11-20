@@ -764,7 +764,7 @@ function CustomToolDialog({
               </div>
               <div className="flex items-center gap-4">
                 <div className="grid gap-1.5">
-                  <Label className="text-xs">Proxy URL (empty = direct)</Label>
+                  <Label className="text-xs">Proxy URL (empty = platform egress)</Label>
                   <Input className="w-56 font-mono text-xs" value={ex.proxy} onChange={(e) => setEx({ ...ex, proxy: e.target.value })} />
                 </div>
                 <label className="mt-4 flex items-center gap-2 text-sm">

@@ -134,7 +134,10 @@ type Tool struct {
 	Dnf string `json:"-"`
 
 	// kind=github: owner/repo + asset name template ({ver} without the v, {arch} = amd64|arm64)
-	// + the binary name inside the archive (empty = same as Bin)
+	// + the binary name inside the archive (empty = same as Bin).
+	// AssetTmpl supports "candidate1||candidate2": each is tried in turn on a 404 (for tools whose
+	// upstream asset naming shifts by version/architecture, e.g. feroxbuster serving only .zip for
+	// arm64 from v2.14).
 	Repo      string `json:"-"`
 	AssetTmpl string `json:"-"`
 	BinInZip  string `json:"-"`
@@ -357,9 +360,11 @@ chmod +x /usr/local/bin/kubectl
 		Repo: "hahwul/dalfox", AssetTmpl: "dalfox-{verv}-linux-{arch2}.tar.gz"},
 	// feroxbuster: directory/file brute force (a Rust replacement for gobuster).
 	// Note its asset name puts the **architecture first**, and uses x86_64 for amd64 and
-	// aarch64 for arm64.
+	// aarch64 for arm64; from v2.14 arm64 ships .zip only (amd64 has both) — the asset name
+	// lists candidates separated by || and the downloader tries them in turn on a 404 (both
+	// hostd and install.sh's table-driven path implement that semantics).
 	{Name: "feroxbuster", Purpose: "directory/file brute force (Rust, multi-threaded and recursive)", Kind: KindGitHub, Category: CatWeb,
-		Repo: "epi052/feroxbuster", AssetTmpl: "{arch2}-linux-feroxbuster.tar.gz"},
+		Repo: "epi052/feroxbuster", AssetTmpl: "{arch2}-linux-feroxbuster.zip||{arch2}-linux-feroxbuster.tar.gz"},
 	// ── Red-team post-exploitation fill-in (2026-10-30): persistence/lateral/tunneling/
 	// credentials ──
 	// socat: the all-purpose replacement for nc (bidirectional pipes, TLS, forwarding),

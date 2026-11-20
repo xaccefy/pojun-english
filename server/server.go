@@ -26,6 +26,7 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/chu0119/pojun/agent"
 	"github.com/chu0119/pojun/db"
+	"github.com/chu0119/pojun/egress"
 	"github.com/chu0119/pojun/hostd"
 	"github.com/chu0119/pojun/intercept"
 	"github.com/chu0119/pojun/listener"
@@ -33,6 +34,7 @@ import (
 	"github.com/chu0119/pojun/llmrec"
 	"github.com/chu0119/pojun/report"
 	"github.com/chu0119/pojun/traffic"
+	"github.com/chu0119/pojun/vault"
 )
 
 // BuildVersion is the backend application version, injected from cmd/pojun at
@@ -51,6 +53,10 @@ type Server struct {
 	keyDir   string       // directory holding jwt.key (next to the executable)
 	dataDir  string       // browsable workspace root
 	jwtKey   atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
+	// revokeCache is the session-revocation state (audit B1): an in-memory cache of sentinel iat + the
+	// jti set, refreshed from settings every 30s TTL; lazily initialized on first use.
+	revokeCache     *revocationCache
+	revokeCacheOnce sync.Once
 
 	// doc preview (v0.4.21): Office/PDF sampled to images, single-worker serial (LibreOffice's
 	// UserInstallation can't run concurrently); the queue only carries artifact ids.
@@ -65,6 +71,10 @@ type Server struct {
 	// listeners is the red-team callback receiver manager (listener package): catches reverse shells /
 	// OOB callbacks with evidence. Port binding needs no privilege (1024+) and bypasses hostd.
 	listeners *listener.Manager
+	// vault is the credential vault (encrypts SSH jump-host passwords/private keys etc.).
+	vault *vault.Store
+	// egress is the SSH jump-host manager: local SOCKS5 → egress through the jump host; the exit address goes straight into the proxy pool.
+	egress *egress.Manager
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -174,11 +184,29 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.jwtKey.Store(key)
 	s.listeners = listener.NewManager()
 	agent.SetListenerManager(s.listeners)
+	s.egress = egress.NewManager()
+	if m.pg != nil {
+		if vs, verr := vault.Open(keyDir, dataDir, m.pg); verr != nil {
+			log.Printf("[vault] initialization failed (credential vault unavailable): %v", verr)
+		} else {
+			s.vault = vs
+		}
+	}
 	agent.SetConnectBackResolver(func(port int) agent.ConnectBack {
 		cb := s.ResolveConnectBack(port)
 		return agent.ConnectBack{Mode: cb.Mode, LHOST: cb.LHOST, LPORT: cb.LPORT, Via: cb.Via}
 	})
 	s.initSideQuestions()
+	// Audit B2: an uninitialized instance generates a one-time setup token (data/setup-token, 0600) and
+	// prints it to the startup log — after a public deployment and before an admin finishes /setup, an
+	// unauthenticated party can't squat /api/auth/init.
+	if m.pg != nil {
+		if hash, _, gerr := m.pg.GetSetting(authPassKey); gerr == nil && hash == "" {
+			if tok, tpath, terr := ensureSetupToken(dataDir); terr == nil {
+				log.Printf("[auth] admin password not initialized: setup token=%s (file %s, 0600; the first /api/auth/init needs the X-Setup-Token request header)", tok, tpath)
+			}
+		}
+	}
 	// breaker threshold/cooldown are hot params on the failure path: push the global retry policy to
 	// Registry once at startup; push again on each policy save (saveLLMRetryPolicy).
 	s.applyRetryPolicy()
@@ -379,6 +407,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -404,6 +433,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	var sessionHeaderKey string
+	var userAgent string
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -411,6 +441,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
+				userAgent = p.UserAgent
 				retry = p.Retry
 				break
 			}
@@ -422,7 +453,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
-		Retry: retry,
+		UserAgent: userAgent,
+		Retry:     retry,
 	})
 	if err != nil {
 		return err
@@ -551,6 +583,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -703,6 +736,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+
+	// session management (audit B1) — global JWT auth + revocation checks apply by default
+	mux.HandleFunc("POST /api/sessions/revoke-all", s.sessionRevokeAll)
+	mux.HandleFunc("POST /api/sessions/revoke-current", s.sessionRevokeCurrent)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
@@ -859,6 +896,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/tasks", s.pgLLMTasks)
 	mux.HandleFunc("GET /api/llm/records/by-model", s.pgTokenByModel) // per-model token usage for this task
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
+	// diagnostics bundle: GET downloads a zip (settings/tasks/intents/traces/logs/traffic/proxy runtime; no traffic bodies or credentials)
+	mux.HandleFunc("GET /api/diagnostics/export", s.handleDiagnosticsExport)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	// Vuln IM push. Channels are 'multi-instance + per-instance filter rules' resources, so they get
@@ -880,6 +919,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/proxypool", s.proxyPoolPut)
 	mux.HandleFunc("POST /api/proxypool/bulk", s.proxyPoolBulk)
 	mux.HandleFunc("POST /api/proxypool/check", s.proxyPoolCheck)
+	mux.HandleFunc("POST /api/proxypool/detect-local", s.proxyPoolDetectLocal)
+	mux.HandleFunc("POST /api/proxypool/subscription/fetch", s.proxyPoolSubscriptionFetch)
+	mux.HandleFunc("GET /api/proxypool/mihomo", s.proxyPoolMihomoStatus)
+	mux.HandleFunc("POST /api/proxypool/mihomo/install", s.proxyPoolMihomoInstall)
+	mux.HandleFunc("POST /api/proxypool/mihomo/start", s.proxyPoolMihomoStart)
+	mux.HandleFunc("POST /api/proxypool/mihomo/delays", s.proxyPoolMihomoDelays)
+	mux.HandleFunc("POST /api/proxypool/mihomo/stop", s.proxyPoolMihomoStop)
+	// SSH jump-host egress: register a jump host → local SOCKS5 → the entry address goes into the proxy pool.
+	mux.HandleFunc("GET /api/egress/ssh", s.listSSHProviders)
+	mux.HandleFunc("POST /api/egress/ssh", s.createSSHProvider)
+	mux.HandleFunc("DELETE /api/egress/ssh/{id}", s.deleteSSHProvider)
+	mux.HandleFunc("POST /api/egress/ssh/{id}/start", s.startSSHProvider)
+	mux.HandleFunc("POST /api/egress/ssh/{id}/stop", s.stopSSHProvider)
+	mux.HandleFunc("POST /api/egress/ssh/{id}/use", s.useSSHProvider)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/report/export", s.exportTaskDocx)
@@ -887,6 +940,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tools/inventory", s.toolsInventory)
 	// Host environment: health check (incl. one-click-install availability) + one-click install (via privileged helper pojun-hostd)
 	mux.HandleFunc("GET /api/hostenv/status", s.hostenvStatus)
+	mux.HandleFunc("PUT /api/hostenv/sources", s.hostenvSaveSources)
 	mux.HandleFunc("GET /api/c2/config", s.c2ConfigGet)
 	mux.HandleFunc("PUT /api/c2/config", s.c2ConfigPut)
 	mux.HandleFunc("GET /api/listeners", s.listenerList)
@@ -1022,7 +1076,7 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := securityHeaders(s.requireAuth(mux))
+	api := securityHeaders(limitRequestBody(s.requireAuth(mux)))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -1521,6 +1575,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ProfileID        *int64 `json:"profile_id"`         // pass when testing a stored profile: empty api_key uses its stored key
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, same default as profile save
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = test also sends this custom session header with a one-off random session id
+		UserAgent        string `json:"user_agent"`         // non-empty = the test request also uses this UA; empty = the profile's stored value/default
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1540,16 +1595,22 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// random session id — see TestConnection). Endpoints like opencode zen requiring x-opencode-session
 	// hard-400 without it — must be present on the test path or you get 'chat works, test 400s'.
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	// The User-Agent follows the profile too: a test request must match real runs exactly, or you get
+	// "test passes, task runs 403" — a WAF blocking the default UA is exactly what this field solves.
+	cfg.UserAgent = req.UserAgent
 	// API-key resolution priority: form input > the specified profile's stored key > global config key.
 	// A stored profile's key never returns to the browser — testing a stored profile means an empty form,
-	// so read it from the DB. Same for the session-header name: absent from the form → fall back to the stored value.
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	// so read it from the DB. Same for the session-header name/UA: absent from the form → fall back to the stored value.
+	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "" || cfg.UserAgent == "") {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
+			}
+			if cfg.UserAgent == "" {
+				cfg.UserAgent = p.UserAgent
 			}
 		}
 	}
@@ -3564,7 +3625,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"tavily_key_set":        strings.TrimSpace(tavilyKey) != "",
 		"web_search_proxy":      proxy,                       // standalone egress proxy (http/https/socks5); empty=direct
 		"global_proxy":          s.m.GlobalProxy(),           // global egress proxy (http/https/socks5) — all target traffic; empty=direct
-		"install_proxy":         s.installProxy(),            // install proxy: host-tool installs only (apt/GitHub downloads), unrelated to target traffic
+		"install_proxy":         s.installProxy(),            // install proxy: host-tool installs, updates and other maintenance requests
 		"python_interpreter":    strings.TrimSpace(pyStored), // user/auto-set value (empty = runtime detection)
 		"workers":               s.m.Workers(),               // concurrent worker agents (default 3); applies to tasks started later
 		// Cold-node compaction's output budget and wall-clock cap. 0 = defaults (32768 tokens / 20 min).
@@ -3583,8 +3644,8 @@ func (s *Server) settingsPayload() map[string]any {
 		"auto_finish_coverage_pct": af.CoveragePct,
 		"auto_finish_max_rounds":   af.MaxRounds,
 		// Dispatch throttle (v0.4.68): this-round add-cap threshold; serial pre-gate defaults off.
-		"intent_queue_limit":    intentQueueLimitFromPG(s.m.pg),
-		"intent_requires_gate":  intentRequiresGateFromPG(s.m.pg),
+		"intent_queue_limit":   intentQueueLimitFromPG(s.m.pg),
+		"intent_requires_gate": intentRequiresGateFromPG(s.m.pg),
 		// Autopilot (v0.4.68): default toggle / stagnation window / deadline-extension cap / refill waves.
 		"autopilot_default":        apc.Default,
 		"autopilot_stall_minutes":  apc.StallMinutes,
@@ -3667,7 +3728,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		TavilyKey        *string `json:"tavily_search_api_key"`
 		WebSearchProxy   *string `json:"web_search_proxy"`   // standalone egress proxy (http/https/socks5); null=unchanged, ""=clear
 		GlobalProxy      *string `json:"global_proxy"`       // global egress proxy (http/https/socks5); null=unchanged, ""=clear (direct)
-		InstallProxy     *string `json:"install_proxy"`      // install proxy: for host-tool installs; null=unchanged, ""=clear (direct). Doesn't trigger agent rebuild
+		InstallProxy     *string `json:"install_proxy"`      // install proxy: for host-tool installs and maintenance; null=unchanged, ""=clear. Doesn't trigger agent rebuild
 		PythonInterp     *string `json:"python_interpreter"` // python interpreter path for custom script tools
 		Workers          *int    `json:"workers"`            // concurrent worker agents (>0); applies to tasks started later
 		// Cold-node compaction's output budget and wall-clock cap. null=unchanged, <=0=reset to default.
@@ -4429,6 +4490,34 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 // securityHeaders replaced the old cors middleware: the frontend and API are same-origin —
 // Access-Control-Allow-Origin:* had no legitimate use here, it only loosened cross-site reads.
 // Also adds the baseline security headers public deployments need.
+// maxAPIBody is the default cap for authenticated JSON request bodies (handlers that bypass decode()
+// and hit NewDecoder directly are covered too). Audit B3: an unbounded json.Decoder loads the whole
+// body into memory — one big request from an authenticated user can blow memory out.
+const maxAPIBody = 32 << 20
+
+// limitRequestBody caps every API request body. The two file-upload endpoints that carry their own
+// larger MaxBytesReader (workspace 512MB / chat 128MB) are exempt; other uploads (skill 20MB etc.)
+// all sit below this cap and are unaffected.
+func limitRequestBody(next http.Handler) http.Handler {
+	exempt := map[string]bool{
+		"POST /api/workspace/upload": true,
+		"POST /api/chat/upload":      true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if exempt[r.Method+" "+r.URL.Path] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.ContentLength > maxAPIBody {
+			writeErr(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("request body too large (limit %d MB)", maxAPIBody>>(10*3)))
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIBody)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

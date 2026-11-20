@@ -180,6 +180,14 @@ type Traffic struct {
 	// rotated per request according to the policy, and failures (RequestError) count
 	// toward tripping it. See pool.go.
 	pool atomic.Pointer[selector]
+	// With strictEgress=true, a configured pool that is fully tripped no longer falls back to
+	// direct/global proxying but fails the request (fail-closed): once the user configured a proxy,
+	// no traffic may leak out from the real IP.
+	strictEgress atomic.Bool
+	// With directRecordFallback=true, strict egress plus a fully tripped pool may still "go direct
+	// while recording": the target request isn't exposed to the pool, but the real egress IP is —
+	// enabled explicitly by the operator.
+	directRecordFallback atomic.Bool
 	// lastPick records host → the pool upstream most recently chosen for it (written on
 	// Pick, read when an error is reported; host granularity is enough for trip statistics,
 	// and the occasional mismatch under concurrent same-host traffic is acceptable).
@@ -236,6 +244,17 @@ func Open(dir, addr string) (*Traffic, error) {
 		if pool := t.pool.Load(); pool != nil {
 			if u := pool.Pick(req.Host); u != nil {
 				t.lastPick.Store(hostOnly(req.Host), u.String())
+				return u, nil
+			}
+			if t.strictEgress.Load() && pool.Configured() {
+				if t.directRecordFallback.Load() {
+					// The operator explicitly chose "direct but still recording": sacrifice real-IP
+					// hiding to keep the traffic evidence chain unbroken.
+					return nil, nil
+				}
+				// Pool configured but fully tripped: point at a local address that always fails so the
+				// request fails fast instead of falling back to upstream/direct and exposing the real IP.
+				u, _ := url.Parse(strictBlockProxy)
 				return u, nil
 			}
 		}

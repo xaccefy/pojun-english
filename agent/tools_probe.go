@@ -15,7 +15,7 @@ package agent
 // **Only drops a script + builds a command — never sends requests itself** — traffic recording, approval
 // gates and audit all auto-apply via Bash; the platform sending requests itself would bypass the whole chain.
 //
-// The script lands idempotently (runDir/pojun-probe.sh); later calls pass only URL lists — minimal commands.
+// The script lands idempotently (runDir/probe.sh); later calls pass only URL lists — minimal commands.
 // No --noproxy: when the environment has a recording proxy (http(s)_proxy env vars), curl automatically
 // goes through it and traffic lands in the viewer as usual; without one it connects directly — same as handwritten curl -k.
 
@@ -30,8 +30,11 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
+// probeScriptName 是探活脚本在 Agent 工作目录里的文件名。
+const probeScriptName = "probe.sh"
+
 const httpProbeScript = `#!/usr/bin/env bash
-# pojun http_probe: emits one compact JSON line per URL (url/status/bytes/time_ms/title/server/content_type/redirect)
+# probe: emits one compact JSON line per URL (url/status/bytes/time_ms/title/server/content_type/redirect)
 for u in "$@"; do
   f=$(mktemp); h=$(mktemp)
   out=$(curl -sS -k -L --max-time 10 -w '%{http_code} %{time_total}' -o "$f" -D "$h" "$u" 2>/dev/null)
@@ -75,10 +78,9 @@ func (t *ToolSet) ensureProbeScript() string {
 	if strings.TrimSpace(t.runDir) == "" {
 		return ""
 	}
-	p := filepath.Join(t.runDir, "pojun-probe.sh")
-	if _, err := os.Stat(p); err == nil {
-		return p
-	}
+	// 每次覆盖写，不复用既有同名文件：runDir 同时是模型写中间产物的目录，
+	// 若模型先创建了同名文件，复用会让工具执行模型的脚本而不是平台脚本。
+	p := filepath.Join(t.runDir, probeScriptName)
 	if err := os.WriteFile(p, []byte(httpProbeScript), 0o755); err != nil {
 		return ""
 	}

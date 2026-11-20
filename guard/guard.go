@@ -11,11 +11,13 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/chu0119/pojun/intercept"
 	"github.com/Autumn-27/norma/hook"
+	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/intercept"
 )
 
 // AuditEntry records one gated tool call.
@@ -73,7 +75,32 @@ func newGuard(ic *intercept.Interceptor) *Guard {
 // Hooks returns the hook registry to attach to an agent session.
 func (g *Guard) Hooks() *hook.Registry { return g.reg }
 
+// unwrapDeferredEvent maps an ExecuteExtraTool call back to the tool it actually
+// invokes: rules, the fallback Judge and the audit log must see the real tool
+// name/params, not the deferred-execution wrapper. Without this, a rule configured
+// for `shell_exec` never fires when the model reaches it through ExecuteExtraTool.
+func unwrapDeferredEvent(ev hook.Event) hook.Event {
+	if ev.ToolName != actool.ExecuteExtraToolName {
+		return ev
+	}
+	var in struct {
+		ToolName string          `json:"tool_name"`
+		Params   json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(ev.Input, &in); err != nil || strings.TrimSpace(in.ToolName) == "" {
+		return ev
+	}
+	ev.ToolName = in.ToolName
+	if len(in.Params) > 0 {
+		ev.Input = in.Params
+	} else {
+		ev.Input = json.RawMessage("{}")
+	}
+	return ev
+}
+
 func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
+	ev = unwrapDeferredEvent(ev)
 	// Extract the shell-command surface for the audit log: Bash + the interactive-shell
 	// tools (shell_open's command, shell_send's text). Destructive/exfil gating is no
 	// longer hard-coded here — it now lives in the DB intercept rules, evaluated by
@@ -197,6 +224,7 @@ var reBlocked = regexp.MustCompile(`(?i)\b(403|forbidden|waf|blocked|rate.?limit
 // results into blocked / error / ok so the planner can change strategy instead
 // of giving up at a WAF.
 func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
+	ev = unwrapDeferredEvent(ev)
 	if ev.ToolName != "Bash" {
 		return hook.Result{}
 	}

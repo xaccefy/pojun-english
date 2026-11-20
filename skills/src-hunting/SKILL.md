@@ -24,7 +24,7 @@ This skill is the **knowledge-base entry point** for SRC/crowdtesting work: `ref
 | Authorization comparison | `auth_request` (request with registered credential groups) + `diff_responses` |
 | SPA/webpack source leakage | `js_audit` (sourcemap restoration + key/endpoint extraction; mandatory for Vue/React) |
 | Recording new assets | `insert_assets` / `add_task_scope` |
-| Artifact persistence | Task directory `/opt/pojun/data/tasks/<id>/` (the "desktop task folder" mentioned in rules means this directory on this platform) |
+| Artifact persistence | The task directory is **the work dir given in the system prompt** (the "desktop task folder" mentioned in rules means that directory) |
 
 File paths in the knowledge base: `${SKILL_DIR}/references/<name>.md`, rules: `${SKILL_DIR}/rules/<name>.md`.
 
@@ -116,7 +116,7 @@ Open first: `breakthrough-short-table.md` (technique index), `recon-methodology.
 | skill-as-boost.md | How to use the skill (open on demand, do not read end to end) |
 | playwright-browser-mcp.md | Browser automation (the platform uses the built-in playwright-cli skill / MCP preset; paths per platform) |
 | cors-vuln-report-priority.md | CORS reporting priority (not hunted in SRC) |
-| desktop-task-folder.md | Task directory convention (on this platform `/opt/pojun/data/tasks/<id>/` wins) |
+| desktop-task-folder.md | Task directory convention (the work dir given in the system prompt wins) |
 
 ## Division of labour with existing skills
 

@@ -32,11 +32,11 @@ func TestHTTPProbeComposesCommand(t *testing.T) {
 	if out.Count != 2 {
 		t.Fatalf("count=%d want 2 (invalid URLs and dupes should be filtered)", out.Count)
 	}
-	if !strings.Contains(out.RunWithBash, "pojun-probe.sh") || !strings.Contains(out.RunWithBash, "https://b.example.com/y?q=1") {
+	if !strings.Contains(out.RunWithBash, "probe.sh") || !strings.Contains(out.RunWithBash, "https://b.example.com/y?q=1") {
 		t.Fatalf("command=%q", out.RunWithBash)
 	}
 	// script landed on disk (invocation is `bash <script>` — doesn't rely on the exec bit; Windows has none).
-	script := filepath.Join(dir, "pojun-probe.sh")
+	script := filepath.Join(dir, probeScriptName)
 	info, err := os.Stat(script)
 	if err != nil {
 		t.Fatalf("script missing: %v", err)

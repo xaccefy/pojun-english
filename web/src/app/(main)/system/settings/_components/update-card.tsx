@@ -10,6 +10,7 @@ import {
   RotateCcwIcon,
   TriangleAlertIcon,
 } from "lucide-react";
+import Link from "next/link";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -246,6 +247,17 @@ export function UpdateCard() {
             {"  "}Configure a global proxy above and retry.
           </p>
         )}
+
+        <p className="text-muted-foreground text-xs">
+          Checking and downloading updates prefers{" "}
+          <Link href="/system/hostenv#install-proxy-settings" className="underline underline-offset-4">
+            Host environment → Install proxy
+          </Link>
+          {" "}(it can also come from <code>POJUN_INSTALL_PROXY</code>). The global proxy is only used when no install proxy is
+          configured; with neither, the connection is direct.
+          {info?.mode === "docker" &&
+            " Under Docker bridge networking 127.0.0.1 points at the container itself — if the proxy runs on the host, enter an address the container can reach."}
+        </p>
 
         {info && !info.comparable && info.reason && <p className="text-muted-foreground text-xs">{info.reason}</p>}
 

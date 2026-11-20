@@ -387,7 +387,10 @@ var findingBrackets = regexp.MustCompile(`[(([\[][^))]\]]*[))]\]]`)
 // a locator key distinguishes them while still merging "the same finding reported again with different evidence".
 var (
 	findingCVERe  = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,}\b`)
-	findingURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>),,]+`)
+	// The exclusion set covers half- and full-width punctuation alike. It previously missed the
+	// full-width left paren (U+FF08), so "http://host（note" swallowed the whole run into the URL,
+	// breaking parsing and producing junk keys.
+	findingURLRe = regexp.MustCompile(`(?i)https?://[^\s"'<>（）()【】\[\]，,。；;]+`)
 	findingPathRe = regexp.MustCompile(`(/[a-zA-Z0-9_\-./]{3,})`)
 	findingPortRe = regexp.MustCompile(`(?i)(?:port|port)\s*[:=]?\s*(\d{1,5})`)
 )
@@ -401,7 +404,8 @@ func findingLocator(in RecordFindingInput) string {
 		if u, err := url.Parse(m); err == nil && u.Host != "" {
 			return strings.ToLower(u.Host + u.EscapedPath())
 		}
-		return strings.ToLower(m)
+		// 解析失败时不回退成原文小写：那会把标点连带的片段写进指纹，
+		// 让同一条漏洞因为措辞不同算出不同指纹。继续尝试路径/端口特征。
 	}
 	if m := findingPathRe.FindString(text); m != "" {
 		return strings.ToLower(strings.TrimRight(m, "/."))

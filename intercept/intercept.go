@@ -776,7 +776,27 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	return Decision{}, false
 }
 
+// toolScopeAllows reports whether a rule carrying the given scope should be
+// evaluated for toolName. 空 scope 表示不限工具——加列前的全部规则都是这个
+// 状态，因此行为不变。
+func toolScopeAllows(scope []string, toolName string) bool {
+	if len(scope) == 0 {
+		return true
+	}
+	for _, s := range scope {
+		if s == toolName {
+			return true
+		}
+	}
+	return false
+}
+
 func ruleMatches(r compiledRule, toolName string, input []byte) bool {
+	// 规则级适用工具：先按工具过滤，再选匹配对象。被排除的规则既不参与匹配，
+	// 也不参与 allow 短路——否则一条只针对 shell 的 allow 会顺带豁免掉别的工具。
+	if !toolScopeAllows(r.ToolScope, toolName) {
+		return false
+	}
 	var subject string
 	switch r.MatchTarget {
 	case "tool_name":

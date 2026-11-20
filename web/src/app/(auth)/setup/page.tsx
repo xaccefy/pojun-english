@@ -12,6 +12,8 @@ import { auth } from "@/lib/auth";
 
 export default function SetupPage() {
   const router = useRouter();
+  // Audit B2: first init needs the server-generated setup token (data/setup-token, 0600)
+  const [setupToken, setSetupToken] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -48,7 +50,7 @@ export default function SetupPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -82,6 +84,21 @@ export default function SetupPage() {
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="setup-token">Setup token (first deployment)</Label>
+                <Input
+                  id="setup-token"
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  placeholder="contents of the server's data/setup-token file"
+                  autoComplete="off"
+                />
+                <p className="text-muted-foreground text-xs">
+                  Anti-squatting for public deployments: the token is in the server startup log and in{" "}
+                  <code>data/setup-token</code> (0600); in Docker it is <code>/app/data/setup-token</code> inside the
+                  container. It is deleted automatically once init succeeds.
+                </p>
+              </div>
               <div className="space-y-1.5">
                 <Label htmlFor="password">New password</Label>
                 <Input

@@ -264,7 +264,8 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 		_ = d.SetSetting("local_exec_default_v1", "true")
 	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (the user
-	// enables it when needed), no proxy by default. The traffic-capture toggle injects/strips
+	// enables it when needed), no proxy by default. --lang=en-US keeps the browser's
+	// Accept-Language and Intl locale English. The traffic-capture toggle injects/strips
 	// the recording proxy + CA at runtime (server.Manager.syncBrowserMCPProxy).
 	// Insert only if absent so we never clobber user edits (args/env/enabled/
 	// visibility) on restart.
@@ -272,7 +273,7 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 INSERT INTO mcp_servers(name, transport, command, args, env, enabled)
 VALUES ('browser', 'stdio', 'npx', $1, '{}', false)
 ON CONFLICT (name) DO NOTHING`,
-		`["@playwright/mcp","--headless"]`); err != nil {
+		`["@playwright/mcp","--headless","--lang=en-US"]`); err != nil {
 		return fmt.Errorf("seed browser mcp: %w", err)
 	}
 	// NOTE: the placeholder ScopeSentry data-source MCP (empty URL + empty X-API-Key,

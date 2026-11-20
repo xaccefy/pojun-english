@@ -17,6 +17,10 @@ func KillJobsForTaskDir(taskDir string) int {
 	if strings.TrimSpace(taskDir) == "" {
 		return 0
 	}
+	// 等所有在途 job_start 完成「启动 + 元数据登记」再扫描。job_start 持读锁；
+	// 没有这把锁时，清理可能恰好扫在进程已启动、JSON 尚未落盘的窗口，漏杀。
+	jobLifecycleMu.Lock()
+	defer jobLifecycleMu.Unlock()
 	jobsDir := filepath.Join(taskDir, "shared", "jobs")
 	entries, err := os.ReadDir(jobsDir)
 	if err != nil {

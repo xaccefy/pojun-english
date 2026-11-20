@@ -12,6 +12,14 @@
 #   cp -r web/out server/webui/dist
 #   CGO_ENABLED=0 GOARCH=amd64 go build -tags embedui -o dist/amd64/pojun ./cmd/pojun
 #   docker build -t pojun:local .
+# kerbrute / waybackurls 上游不发 linux/arm64 资产，用 Go 现场编译补齐
+# （builder 走目标平台的 golang 镜像，产物架构自动正确；QEMU 下只编译这两个
+# 小工具，构建时间增加可控）。
+FROM golang:1.26-bookworm AS gobuild
+ENV CGO_ENABLED=0 GOBIN=/go/bin
+RUN go install github.com/ropnop/kerbrute@v1.0.3 \
+    && go install github.com/tomnomnom/waybackurls@v0.1.0
+
 FROM python:3.11-slim-bookworm
 ARG TARGETARCH
 # Build sources (official defaults; override with --build-arg on restricted
@@ -49,6 +57,9 @@ RUN apt-get update \
     && curl -fsSL "$NODESOURCE_URL" | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+# kerbrute/waybackurls (upstream ships no arm64 assets; built in the gobuild stage)
+COPY --from=gobuild /go/bin/kerbrute /usr/local/bin/kerbrute
+COPY --from=gobuild /go/bin/waybackurls /usr/local/bin/waybackurls
 # nuclei (vulnerability template scanning engine, works with the
 # /app/nuclei-templates intel template library): the official release binary
 # is downloaded per-arch; the template tree is maintained by pojun's vulnintel
@@ -97,7 +108,7 @@ COPY dist/${TARGETARCH}/pojun-hostd /app/pojun-hostd
 # without forwarding pojun never sees it, cannot shut down gracefully, and is
 # SIGKILLed after 10 seconds.
 COPY start.sh /app/start.sh
-RUN chmod +x /app/pojun /app/start.sh
+RUN chmod +x /app/pojun /app/pojun-hostd /app/start.sh
 COPY skills/ /app/skills/
 # Official-document fonts: needed for docx->PDF rendering (install.sh downloads
 # them from raw in binary form; the image COPYs the in-repo files directly)

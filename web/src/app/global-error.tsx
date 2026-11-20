@@ -18,7 +18,7 @@ export default function GlobalError({ error, reset }: ErrorProps) {
 
   const text = [error?.name, error?.message].filter(Boolean).join(": ") || String(error);
   return (
-    <html lang="zh-CN">
+    <html lang="en">
       <body
         style={{
           margin: 0,

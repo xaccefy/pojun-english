@@ -33,10 +33,22 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// jobLifecycleMu 串行化「作业启动+登记」与「暂停/删除清理」。
+//
+// job_start 从开始启动到元数据落盘必须持读锁；KillJobsForTaskDir 持写锁。
+// 没有这把锁时，清理会扫描不到「进程已启动、JSON 还没写」的作业，暂停后它
+// 继续在后台打目标（issue #18）。锁是进程内全局的：job 启停频率很低，没必要
+// 为每个任务目录维护一张锁表。
+var jobLifecycleMu sync.RWMutex
+
+// jobStartAfterStartHook 仅测试使用：进程已启动（带 PID）、元数据尚未落盘。生产恒为 nil。
+var jobStartAfterStartHook func(pid int)
 
 type jobMeta struct {
 	Name     string `json:"name"`
@@ -138,7 +150,7 @@ func (t *ToolSet) jobStart() actool.CoreTool {
 			"command": str("bash command to run (work dir = task shared dir)"),
 			"env":     str("extra env vars, 'K=V&K2=V2' (optional)"),
 		}, "name", "command"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Name    string `json:"name"`
 				Command string `json:"command"`
@@ -155,6 +167,17 @@ func (t *ToolSet) jobStart() actool.CoreTool {
 			dir := t.jobsDir()
 			if dir == "" {
 				return actool.Errorf("task shared dir unavailable (runDir not injected)"), nil
+			}
+			// Pause/delete cleanup (KillJobsForTaskDir) takes the write lock. "Start + persist metadata" is put
+			// under the write lock as a whole: ① cleanup either finishes before the start (the ctx check then
+			// refuses) or scans again after registration and kills it, so a job started mid-way is never missed;
+			// ② same-name concurrent starts are serialized — under a read lock two same-name job_starts could both
+			// read "no old job" and both start, the later meta write overwrote the first, and the earlier process
+			// became an orphan cleanup couldn't find (audit F3). Job starts are rare, so serializing costs nothing.
+			jobLifecycleMu.Lock()
+			defer jobLifecycleMu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return actool.Errorf("task paused or execution cancelled — refusing to start a background job"), nil
 			}
 			script := filepath.Join(dir, name+".sh")
 			logPath := filepath.Join(dir, name+".log")
@@ -190,7 +213,10 @@ func (t *ToolSet) jobStart() actool.CoreTool {
 			cmd.Dir = filepath.Dir(dir)
 			// Separate process group: job_stop kills the whole group — inner scripts/children end together (no longer killing just the outer wrapper shell).
 			cmd.SysProcAttr = jobSysProcAttr()
-			env := os.Environ()
+			// A background job must share the foreground Bash's egress: inherit the task egress proxy and
+			// override any proxy variables left in the parent process (otherwise a long scan goes direct from
+			// the real IP and leaves nothing in the MITM).
+			env := mergeProxyEnv(os.Environ(), t.egressProxy, t.egressCA)
 			for _, kv := range strings.Split(a.Env, "&") {
 				k, v, ok := strings.Cut(kv, "=")
 				if ok && strings.TrimSpace(k) != "" {
@@ -198,8 +224,14 @@ func (t *ToolSet) jobStart() actool.CoreTool {
 				}
 			}
 			cmd.Env = env
+			if err := ctx.Err(); err != nil {
+				return actool.Errorf("task paused or execution cancelled — refusing to start a background job"), nil
+			}
 			if err := cmd.Start(); err != nil {
 				return actool.Errorf("failed to start the job: " + err.Error()), nil
+			}
+			if jobStartAfterStartHook != nil {
+				jobStartAfterStartHook(cmd.Process.Pid)
 			}
 			pid := cmd.Process.Pid
 			// Jobs outlive runs: reap via a background Wait — not Release. Release doesn't reap children;
@@ -211,8 +243,16 @@ func (t *ToolSet) jobStart() actool.CoreTool {
 				Script:  script, Log: logPath, RCFile: rcPath,
 				Intent: t.ownerNode,
 			}
-			if b, err := json.MarshalIndent(m, "", "  "); err == nil {
-				_ = os.WriteFile(metaPath, b, 0o644)
+			b, err := json.MarshalIndent(m, "", "  ")
+			if err == nil {
+				err = os.WriteFile(metaPath, b, 0o644)
+			}
+			if err != nil {
+				// With no metadata written the process never enters the job ledger and pause/delete can't find
+				// it — kill the whole group at once, never leave an untrackable background process.
+				_ = jobKillGroup(pid)
+				jobWaitGone(pid, 2*time.Second)
+				return actool.Errorf("failed to write job metadata (process terminated): " + err.Error()), nil
 			}
 			return jsonResult(map[string]any{
 				"name":   name,

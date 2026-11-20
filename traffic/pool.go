@@ -166,20 +166,8 @@ func (s *selector) Pick(host string) *url.URL {
 	}
 }
 
-// findUpstream finds an entry by its original URL among a set of candidates (the pinning
-// is reconciled by URL string, so it survives a pool reload).
-func findUpstream(list []*poolUpstream, raw string) *poolUpstream {
-	for _, e := range list {
-		if e.raw.String() == raw {
-			return e
-		}
-	}
-	return nil
-}
-
-// ReportFailure reports one failure of an upstream proxy (the target host is carried for
-// diagnostics; currently only counted). Reaching the consecutive-failure threshold trips
-// it for 10 minutes; a single success resets the count.
+// ReportResult reports one upstream proxy result: a success resets the count and clears any
+// trip; a failure counts and trips the upstream for breakCooldown at the threshold.
 func (s *selector) ReportResult(proxyRaw string, ok bool) {
 	if proxyRaw == "" {
 		return
@@ -194,6 +182,7 @@ func (s *selector) ReportResult(proxyRaw string, ok bool) {
 		now := time.Now().Unix()
 		if ok {
 			e.failures.Store(0)
+			e.breakOpen.Store(0) // one success clears the trip
 			e.lastOK.Store(now)
 			return
 		}
@@ -372,4 +361,190 @@ func (t *Traffic) ProxyPoolReportBad(target string, cooldown time.Duration) stri
 	}
 	u, _ := raw.(string)
 	return pool.MarkBad(u, cooldown)
+}
+
+// Available returns the number of upstreams not currently tripped.
+func (s *selector) Available() int {
+	s.mu.Lock()
+	entries := s.entries
+	s.mu.Unlock()
+	now := time.Now().Unix()
+	n := 0
+	for _, e := range entries {
+		if bo := e.breakOpen.Load(); bo != 0 && now < bo {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// SnapshotBreaks exports the not-yet-expired trip state (unmasked raw URL → release time unix).
+// A process restart rebuilds the selector; without persisting, every exit already judged dead
+// becomes "available" again and tasks burn another round of timeouts — measured on production,
+// 231 of 240 dead proxies all came back to life after a restart.
+func (s *selector) SnapshotBreaks() map[string]int64 {
+	s.mu.Lock()
+	entries := s.entries
+	s.mu.Unlock()
+	now := time.Now().Unix()
+	out := map[string]int64{}
+	for _, e := range entries {
+		if bo := e.breakOpen.Load(); bo > now {
+			out[e.raw.String()] = bo
+		}
+	}
+	return out
+}
+
+// RestoreBreaks applies persisted trip state (only entries still within their window count).
+func (s *selector) RestoreBreaks(state map[string]int64) int {
+	if len(state) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	entries := s.entries
+	s.mu.Unlock()
+	now := time.Now().Unix()
+	n := 0
+	for _, e := range entries {
+		until, ok := state[e.raw.String()]
+		if !ok || until <= now {
+			continue
+		}
+		e.breakOpen.Store(until)
+		if e.lastFail.Load() == 0 {
+			e.lastFail.Store(now)
+		}
+		n++
+	}
+	return n
+}
+
+// findUpstream finds an entry by its original URL among a set of candidates (the pinning
+// is reconciled by URL string, so it survives a pool reload).
+func findUpstream(list []*poolUpstream, raw string) *poolUpstream {
+	for _, e := range list {
+		if e.raw.String() == raw {
+			return e
+		}
+	}
+	return nil
+}
+
+// ClearBreak clears an upstream's trip/failure state (called after an import or manual
+// liveness check passes). Without the reset, "the check says it works but the page still shows
+// 0 available" — the old trip state is inherited on the next pool push.
+func (s *selector) ClearBreak(proxyRaw string) bool {
+	if proxyRaw == "" {
+		return false
+	}
+	s.mu.Lock()
+	entries := s.entries
+	s.mu.Unlock()
+	for _, e := range entries {
+		if e.raw.String() != proxyRaw {
+			continue
+		}
+		e.failures.Store(0)
+		e.breakOpen.Store(0)
+		return true
+	}
+	return false
+}
+
+// MarkBad trips an upstream for the cooldown immediately (used by active health checks / Agent
+// reports). Passive tripping waits for 5 consecutive failures, and retrying a proxy already known
+// to be dead 5 more times only slows requests down for nothing — so an active determination cools
+// it down at once. Returns the masked URL of the tripped upstream, empty string if not found.
+
+// ProxyPoolClearBreak clears an upstream's trip state (called after an import or manual liveness
+// check succeeds). Returns whether the entry was found; false when the pool is empty.
+func (t *Traffic) ProxyPoolClearBreak(proxyRaw string) bool {
+	pool := t.pool.Load()
+	if pool == nil {
+		return false
+	}
+	return pool.ClearBreak(proxyRaw)
+}
+
+// ProxyPoolMarkBad trips an upstream for the cooldown immediately (used by active health checks /
+// on a failed manual verification). Returns the masked URL of the tripped upstream, empty string if
+// it isn't in the pool.
+
+// An empty host is treated as one "virtual target" per policy; sticky_host_random therefore pins
+// the whole machine to a single exit, matching the "one exit per task" intuition.
+func (t *Traffic) ProxyPoolPick(host string) string {
+	pool := t.pool.Load()
+	if pool == nil {
+		return ""
+	}
+	if u := pool.Pick(host); u != nil {
+		return u.String()
+	}
+	return ""
+}
+
+// ProxyPoolAvailable returns the number of upstreams not currently tripped (the UI shows "N/M available").
+func (t *Traffic) ProxyPoolAvailable() int {
+	pool := t.pool.Load()
+	if pool == nil {
+		return 0
+	}
+	return pool.Available()
+}
+
+// SnapshotProxyBreaks exports unexpired trip state (for the server to persist across restarts).
+func (t *Traffic) SnapshotProxyBreaks() map[string]int64 {
+	pool := t.pool.Load()
+	if pool == nil {
+		return nil
+	}
+	return pool.SnapshotBreaks()
+}
+
+// RestoreProxyBreaks applies persisted trip state and returns the number of entries restored.
+func (t *Traffic) RestoreProxyBreaks(state map[string]int64) int {
+	pool := t.pool.Load()
+	if pool == nil {
+		return 0
+	}
+	return pool.RestoreBreaks(state)
+}
+
+// strictBlockProxy is the sentinel address returned under "strict egress" when the pool is fully
+// tripped: 127.0.0.1:1 always fails to connect, so the request errors out fast instead of going
+// direct and leaking the real IP.
+const strictBlockProxy = "http://127.0.0.1:1"
+
+// SetStrictEgress toggles strict egress: with a pool configured but no usable upstream, both MITM
+// and Agent fail rather than falling back to a direct connection. Injected by the server from the
+// egress_strict_proxy setting.
+func (t *Traffic) SetStrictEgress(on bool) { t.strictEgress.Store(on) }
+
+// SetDirectRecordFallback enables "direct dial but still record" when strict
+// egress is on and every pool upstream is broken. Operators opt in explicitly;
+// it trades real-IP exposure for continuous traffic evidence.
+func (t *Traffic) SetDirectRecordFallback(on bool) { t.directRecordFallback.Store(on) }
+
+// DirectRecordFallback reports the current fallback switch.
+func (t *Traffic) DirectRecordFallback() bool { return t.directRecordFallback.Load() }
+
+// StrictEgress returns the current strict-egress switch state.
+func (t *Traffic) StrictEgress() bool { return t.strictEgress.Load() }
+
+// ProxyPoolConfigured reports whether the pool has any enabled entry (a fully tripped pool still counts as configured).
+func (t *Traffic) ProxyPoolConfigured() bool {
+	pool := t.pool.Load()
+	if pool == nil {
+		return false
+	}
+	return pool.Configured()
+}
+
+// Configured reports whether the selector holds at least one enabled entry.
+func (s *selector) Configured() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.entries) > 0
 }

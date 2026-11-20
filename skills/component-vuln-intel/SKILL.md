@@ -41,6 +41,8 @@ database (NVD + CISA KEV + GHSA + PoC aggregation) is the only trustworthy sourc
 - Confirm template coverage first: `nuclei -t <matching template/tag> -u <url> -severity high,critical -stats`;
 - The platform tool `scan_with_nuclei` assembles the command and keeps traffic; when running it yourself, write
   results to a file and then `save_evidence`;
+- With an egress proxy configured on the platform, always append `-proxy "$EGRESS_PROXY"` to a hand-written `nuclei`
+  command; `scan_with_nuclei` already adds it, don't add it twice.
 - Template hit ≠ vulnerability: check whether the request/response really triggers it (some templates only match a version banner);
 - For high-risk templates (RCE etc.), first confirm the target is authorized and the business will not be affected, then run.
 

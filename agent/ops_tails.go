@@ -14,10 +14,13 @@ const scannerFirstGuidance = `
 - **Directory/path discovery**: on **confirmed-live, non-purely-static** HTTP services (main site/admin/gateway — pick 3–5 high-value
   targets first, don't blanket every subdomain) run one directory brute-force, then eyeball results:
   ` + "`ffuf -u <base>/FUZZ -w /opt/SecLists/Discovery/Web-Content/raft-medium-directories.txt -t 10 -rate 30 -timeout 10 -mc 200,204,301,302,401,403 -o ffuf.json -of json`" + `
-  (or ` + "`gobuster dir -u <base> -w same-wordlist -t 10 --delay 200ms`" + `). Focus on 401/403 and unusual 200s — admin/APIs often hide there.
+  (or ` + "`gobuster dir -u <base> -w same-wordlist -t 10 --delay 200ms`" + `). Focus on 401/403 and unusual 200s — admin panels/APIs often hide there.
 - **Components/known CVEs**: first ` + "`search_vulns`" + ` for the component's CVEs, then
-  ` + "`nuclei -u <url> -severity critical,high -rate-limit 30 -random-agent -jsonl -o out.jsonl`" + `
-  (or build the command via scan_with_nuclei). Empty output = no hits, not a failure; hits must be re-verified then report_finding.
+  ` + "`nuclei -u <url> -severity critical,high -rate-limit 30 -jsonl -o out.jsonl ${EGRESS_PROXY:+-proxy \"$EGRESS_PROXY\"}`" + `
+  (or build the command via scan_with_nuclei, which adds -proxy per the platform egress automatically — don't add it twice).
+  When an egress proxy is configured (i.e. $EGRESS_PROXY is non-empty in Bash), a hand-typed nuclei command must add ` + "`-proxy \"$EGRESS_PROXY\"`" + `;
+  the ` + "`${EGRESS_PROXY:+...}`" + ` form in the example is omitted entirely when unset, so no empty -proxy is left behind.
+  Empty output = no hits, not a failure; any hit must be re-verified, then report_finding.
 - **Endpoints with params**: injection only matters on input points — GET/POST params, JSON fields, cookies. First run
   ` + "`sqlmap -u \"<url>\" --batch --level=2 --risk=1 --timeout 10 --flush-session [--data=... --cookie=...]`" + `
   a read-only probe (level 2 / risk 1 — no writes); take minimal proof only after injectability is confirmed.

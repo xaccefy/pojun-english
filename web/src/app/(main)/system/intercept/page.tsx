@@ -150,6 +150,8 @@ type RuleForm = {
   priority: number;
   match_target: "tool_name" | "tool_input";
   match_type: "string" | "regex";
+  // Applies-to tools; an empty array = any tool (the default, matching the old behavior). Only used for the tool_input target.
+  tool_scope: string[];
   pattern: string;
   action: InterceptAction;
   message: string;
@@ -164,6 +166,7 @@ const defaultForm = (): RuleForm => ({
   priority: 0,
   match_target: "tool_name",
   match_type: "string",
+  tool_scope: [],
   pattern: "",
   action: "deny",
   message: "",
@@ -526,6 +529,7 @@ export default function InterceptPage() {
     setForm({
       name: rule.name, enabled: rule.enabled, priority: rule.priority,
       match_target: rule.match_target, match_type: rule.match_type,
+      tool_scope: rule.tool_scope ?? [],
       pattern: rule.pattern, action: rule.action, message: rule.message,
       timeout_enabled: rule.timeout_enabled, timeout_seconds: rule.timeout_seconds,
       timeout_action: rule.timeout_action,
@@ -830,7 +834,28 @@ export default function InterceptPage() {
               </Select>
             </Field>
 
-            <Field label="Match Type">
+            {form.match_target === "tool_input" && (
+              <Field label="Applies to tools (empty = any tool)">
+                <Input
+                  value={form.tool_scope.join(", ")}
+                  onChange={(e) =>
+                    set({
+                      tool_scope: e.target.value
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean),
+                    })
+                  }
+                  placeholder="Empty applies to every tool; to restrict to shell tools enter Bash, shell_open"
+                />
+                <p className="text-muted-foreground text-xs">
+                  The same text is data when it appears in a write-file tool's body and a command only when it appears
+                  in a command field. Give command rules a tool list to avoid false triggers from report bodies.
+                </p>
+              </Field>
+            )}
+
+            <Field label="Match type">
               <Select
                 value={form.match_type}
                 onValueChange={(v) => set({ match_type: v as RuleForm["match_type"] })}

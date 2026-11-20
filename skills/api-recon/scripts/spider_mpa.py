@@ -19,7 +19,9 @@ from html.parser import HTMLParser
 from collections import deque
 
 CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
-UA = "Mozilla/5.0 (spa-api-recon spider)"
+# 不要在脚本里写死可读标记：UA 会出现在目标的访问日志里。
+# 需要指定 UA 时用环境变量 RECON_UA；缺省值必须中性、不含产品/能力名。
+UA = os.environ.get("RECON_UA") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SKIP_EXT = re.compile(r'\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf|pdf|zip|mp4|webp|js)(\?|$)', re.I)
 API_HINT = re.compile(r'/(?:api|rest|service|ajax|action|do|rpc|graphql|v\d|admin|backend)\b', re.I)
 

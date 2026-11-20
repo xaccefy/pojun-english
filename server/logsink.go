@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chu0119/pojun/db"
@@ -41,6 +42,15 @@ type logSinkT struct {
 
 	dbOnce sync.Once
 	dbCh   chan dbWriteReq // buffered async channel; nil until SetDB is called
+
+	// panic 风暴折叠：同一秒几百条相同 panic 会把环形缓冲与 server_logs 刷满，
+	// 让诊断包看不到任何其它日志。按“首行归一化签名 + 分钟窗口”每签名最多留 5 条，
+	// 其余丢弃并计数（dropped 在诊断包里可见）。
+	panicMu   sync.Mutex
+	panicWin  int64
+	panicSeen map[string]int
+	dropped   atomic.Int64
+	dbDropped atomic.Int64
 }
 
 var logSink = &logSinkT{cap: 3000, subs: map[chan LogLine]struct{}{}, out: os.Stderr}
@@ -114,6 +124,22 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 				}
 			}
 		}()
+		// Retention: server_logs 旧实现无清理，panic 风暴/长期运行会把表撑到无法查询。
+		// 每小时清一次：保留 7 天、最多 100 万行（诊断包只取窗口内聚合）。
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				if err := pg.PruneLogs(7*24*time.Hour, 1_000_000); err != nil {
+					_, _ = os.Stderr.Write([]byte("[logsink] prune: " + err.Error() + "\n"))
+				}
+				select {
+				case <-ticker.C:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 	})
 }
 
@@ -121,10 +147,51 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 func (s *logSinkT) Write(p []byte) (int, error) {
 	_, _ = s.out.Write(p) // keep the terminal output
 	line := strings.TrimRight(string(p), "\n")
-	if strings.TrimSpace(line) != "" {
-		s.add(parseLog(line))
+	if strings.TrimSpace(line) == "" {
+		return len(p), nil
 	}
+	if s.dropPanicFlood(line) {
+		s.dropped.Add(1)
+		return len(p), nil
+	}
+	s.add(parseLog(line))
 	return len(p), nil
+}
+
+// panicFloodWindow 把 panic 日志按“首行签名 + 分钟窗口”限量。返回 true = 丢弃。
+// 只作用于以 http:panic serving / panic: 开头的多行栈；普通日志不受影响。
+func (s *logSinkT) dropPanicFlood(line string) bool {
+	first := line
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	if !strings.Contains(first, "panic serving") && !strings.HasPrefix(first, "panic:") {
+		return false
+	}
+	sig := first
+	if i := strings.LastIndex(sig, "127.0.0.1:"); i >= 0 {
+		sig = sig[:i] // 去掉随机端口
+	}
+	s.panicMu.Lock()
+	defer s.panicMu.Unlock()
+	win := time.Now().Unix() / 60
+	if s.panicWin != win {
+		s.panicWin = win
+		s.panicSeen = map[string]int{}
+	}
+	if s.panicSeen[sig] >= 5 {
+		return true
+	}
+	s.panicSeen[sig]++
+	return false
+}
+
+// DroppedLogs 返回因 panic 折叠丢弃的行数（诊断包可见）。
+func (s *logSinkT) DroppedLogs() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.dropped.Load()
 }
 
 func (s *logSinkT) add(l LogLine) {
@@ -147,6 +214,7 @@ func (s *logSinkT) add(l LogLine) {
 		select {
 		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
 		default:
+			s.dbDropped.Add(1)
 		}
 	}
 

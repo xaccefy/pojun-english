@@ -54,7 +54,9 @@ type authCheckResult struct {
 // SuccessContains must both hold; with neither configured, 2xx/3xx counts as success.
 // Details never carry the password/TOTP/response body (status code and match note
 // only).
-func runAuthCheck(cfg *db.TaskAuthConfig) authCheckResult {
+// proxyAddr / caCert are the platform egress (recording proxy / proxy pool / global proxy);
+// empty string = direct (tests).
+func runAuthCheck(cfg *db.TaskAuthConfig, proxyAddr, caCert string) authCheckResult {
 	res := authCheckResult{CheckedAt: time.Now().UTC().Format(time.RFC3339)}
 	start := time.Now()
 	if cfg == nil || !cfg.Enabled {
@@ -127,6 +129,9 @@ func runAuthCheck(cfg *db.TaskAuthConfig) authCheckResult {
 		req.Header.Set(k, v)
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
+	if tr := proxyTransport(proxyAddr, caCert); tr != nil {
+		client.Transport = tr
+	}
 	resp, err := client.Do(req)
 	res.ElapsedMS = time.Since(start).Milliseconds()
 	if err != nil {
@@ -182,5 +187,5 @@ func (s *Server) taskAuthCheck(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "this task has no login credentials configured")
 		return
 	}
-	writeJSON(w, 200, runAuthCheck(t.AuthConfig))
+	writeJSON(w, 200, runAuthCheck(t.AuthConfig, s.m.ProxyAddr(), s.m.ProxyCACert()))
 }

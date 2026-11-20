@@ -185,3 +185,55 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
 	}
 }
+
+// TestHTTPToolDefaultsToPlatformProxy 验证自定义 http 工具在未配置代理时走平台
+// 出口（记录代理 / 出口池 / 全局代理），而不是从平台真实 IP 直连目标。
+func TestHTTPToolDefaultsToPlatformProxy(t *testing.T) {
+	var directHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directHits++
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("direct-hit"))
+	}))
+	defer target.Close()
+
+	var seen []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.String())
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("proxied-hit"))
+	}))
+	defer proxy.Close()
+
+	s := &Server{m: &Manager{globalProxy: proxy.URL}}
+	execRaw, _ := json.Marshal(map[string]any{"method": "GET", "url": target.URL + "/x"})
+	res, err := s.runHTTPTool(context.Background(), execRaw, map[string]any{}, nil)
+	if err != nil {
+		t.Fatalf("runHTTPTool: %v", err)
+	}
+	if out := res.Flatten(); !strings.Contains(out, "proxied-hit") {
+		t.Fatalf("request did not use the platform proxy: %s", out)
+	}
+	if directHits != 0 {
+		t.Fatalf("target was dialed directly %d time(s)", directHits)
+	}
+	if len(seen) != 1 || !strings.Contains(seen[0], target.URL) {
+		t.Fatalf("proxy saw unexpected requests: %v", seen)
+	}
+}
+
+// TestProxyTransportAcceptsBothSpellings 钉住代理地址的两种写法：Manager.ProxyAddr
+// 可能返回 host:port，也可能返回带 scheme 的 URL；两种都不得被二次拼接成坏地址。
+func TestProxyTransportAcceptsBothSpellings(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	for _, addr := range []string{"127.0.0.1:3128", "http://127.0.0.1:3128"} {
+		tr := proxyTransport(addr, "")
+		if tr == nil || tr.Proxy == nil {
+			t.Fatalf("proxyTransport(%q) returned no proxy", addr)
+		}
+		u, err := tr.Proxy(req)
+		if err != nil || u.String() != "http://127.0.0.1:3128" {
+			t.Fatalf("proxyTransport(%q) -> %v, %v", addr, u, err)
+		}
+	}
+}

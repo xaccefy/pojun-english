@@ -54,6 +54,8 @@ git clone --depth 1 https://github.com/chu0119/Pojun.git pojun && cd pojun
 cp .env.example .env    # use `copy` on Windows; change at least POSTGRES_PASSWORD
 # Windows (Docker Desktop, WSL2 backend):
 docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d
+# macOS (Docker Desktop / OrbStack):
+docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
 # Linux / others:
 docker compose up -d
 # → http://localhost:8787
@@ -62,7 +64,9 @@ docker compose up -d
 **Once installed (3-minute onboarding):**
 
 1. Open `http://<host>:8787` in a browser → initialize the admin password (≥8 chars)
-2. Configure a model channel on the "LLM Config" page (≥2 channels + round-robin on = recommended for real work)
+2. Configure a model channel on the "LLM Config" page (≥2 channels + round-robin on = recommended for real work);
+   for Anthropic/OpenAI/DeepSeek and other OpenAI-compatible endpoints fill base_url + key + model directly
+   (e.g. DeepSeek: `https://api.deepseek.com` + `deepseek-chat`/`deepseek-reasoner`)
 3. One-click install all tools on the "Host Environment" page (the Docker image already bundles all 66 — skippable)
 4. Create a task, give it a one-line objective
 

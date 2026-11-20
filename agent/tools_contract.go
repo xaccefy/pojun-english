@@ -192,7 +192,7 @@ func WriteContractScript(dir string) (string, error) {
 // Why single out 'auth-required endpoints': they're the entry point for privesc/unauthorized mining.
 // Mixed into hundreds of endpoints, the model would probably only look at the first few.
 const contractScriptSource = `#!/usr/bin/env python3
-"""API contract parsing (the execution side of the POJUN agent tool api_contract).
+"""API contract parsing (the execution side of the agent tool api_contract).
 
 Usage: api_contract.py <contract file>
 Supports OpenAPI 3 / Swagger 2.0 (JSON); YAML isn't parsed (extra deps needed);

@@ -22,9 +22,16 @@ import (
 	"github.com/chu0119/pojun/enrich"
 	"github.com/chu0119/pojun/guard"
 	"github.com/chu0119/pojun/intercept"
+	"github.com/chu0119/pojun/mihomo"
 	"github.com/chu0119/pojun/traffic"
 	"github.com/chu0119/pojun/vulnintel"
 )
+
+// vulnSyncDisabled is set by tests in TestMain. Test processes don't need real intel sync or a
+// nuclei template tree: every Manager spawns a background goroutine that git clones a ~14k-file /
+// 64MB tree into a temp workspace, and when cleanup lags at test end it leaves the whole directory
+// under %TEMP% (measured: one full test run can pile up tens of GB).
+var vulnSyncDisabled bool
 
 // Task is one engagement: a description + goal + its own exploration store,
 // sharing the process-wide asset store. ID is the PG task id as a string; ExpID
@@ -120,6 +127,9 @@ func (t *Task) requestSettle(reason, detail string) {
 	t.settleMu.Lock()
 	t.pendingSettleReason, t.pendingSettleDetail = reason, detail
 	t.settleMu.Unlock()
+	// The record point must leave a trace: "recorded" and "consumed" are two separate events on the
+	// wrap-up chain, and without the former you only see a task that never ends with no clue why.
+	log.Printf("[settle] task %s recorded wrap-up predicate %s (%s)", t.ID, reason, detail)
 }
 
 func (t *Task) peekSettle() (string, string) {
@@ -295,6 +305,7 @@ type Manager struct {
 	pg          *pgdb.DB
 	assets      *pgdb.AssetStore
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
+	mihomo      *mihomo.Manager        // local Clash.Meta core (subscription YAML → mixed-port → proxy-pool entry)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
 	vulnintel   *vulnintel.Store       // public CVE/KEV intel store (agent search_vulns reads it)
@@ -362,6 +373,13 @@ const (
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
 	settingGlobalProxy = "global_proxy"
+	// settingEgressStrict is the 'strict egress' switch (off by default in the public build, toggleable
+	// in the UI): with a pool configured but fully tripped/unusable, don't fall back to direct — fail the
+	// target request. Once a proxy is configured, the real IP may not leak out.
+	settingEgressStrict = "egress_strict_proxy"
+	// settingEgressDirectFallback is the 'direct but still recording' fallback under strict egress (off
+	// by default).
+	settingEgressDirectFallback = "traffic_direct_record_fallback"
 	// settingInstallProxy is the egress proxy for 'installing things'
 	// (http/https/socks5, empty = direct). It only affects apt / curl / GitHub downloads
 	// during host-tool installs — fully independent of the agent's target-traffic proxy
@@ -629,7 +647,8 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
-	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	mihomoMgr := mihomo.New(dir)
+	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg), mihomo: mihomoMgr}
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
@@ -694,16 +713,38 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		if err := m.traffic.SetUpstreamProxy(m.globalProxy); err != nil {
 			log.Printf("[proxy] global proxy %q invalid, ignored: %v", m.globalProxy, err)
 		}
+		// Strict egress (off by default; a UI switch). With the pool fully tripped, fail closed — no
+		// direct connection leaking the real IP.
+		strict := pg.GetBool(settingEgressStrict, false)
+		m.traffic.SetStrictEgress(strict)
+		m.traffic.SetDirectRecordFallback(pg.GetBool(settingEgressDirectFallback, false))
 		// proxy-pool restore (the upstream hook is 'pool first' — a non-empty pool
 		// overrides the single proxy above). Runs after manager's field-restore section,
 		// independent of capture state (the pool only affects egress selection).
 		if pool := loadProxyPoolState(pg); pool != nil {
-			if err := m.traffic.SetProxyPool(pool.Entries, pool.Strategy); err != nil {
+			entries := pool.Entries
+			if !pg.GetBool(settingProxyAllowSocks5, true) {
+				kept := make([]traffic.PoolEntry, 0, len(entries))
+				for _, e := range entries {
+					if strings.HasPrefix(strings.ToLower(strings.TrimSpace(e.URL)), "socks5://") {
+						continue
+					}
+					kept = append(kept, e)
+				}
+				entries = kept
+			}
+			if !pool.Enabled {
+				entries = nil // master switch off: same as "pool empty"
+			}
+			if err := m.traffic.SetProxyPool(entries, pool.Strategy); err != nil {
 				log.Printf("[proxypool] pool restore failed: %v", err)
-			} else if len(pool.Entries) > 0 {
-				log.Printf("[proxypool] restored %d upstream proxies (strategy %s, pool takes priority over the global proxy)", len(pool.Entries), pool.Strategy)
+			} else if len(entries) > 0 {
+				log.Printf("[proxypool] restored %d upstream proxies (strategy %s, pool takes priority over the global proxy)", len(entries), pool.Strategy)
+				m.restoreProxyBreaks() // keep "known dead" across restarts so dead proxies don't revive
 			}
 		}
+		// With the pool empty or fully tripped, probe the local Clash mixed port in the background (non-blocking).
+		go autoDetectLocalProxyForManager(context.Background(), m)
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
@@ -717,7 +758,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	m.nucleiDir = vulnintel.TemplatesDir(m.dir)
 	agent.SetVulnIntelStore(m.vulnintel)
 	agent.SetNucleiTemplatesDir(m.nucleiDir)
-	if pg.GetBool(settingVulnIntelOn, true) {
+	if pg.GetBool(settingVulnIntelOn, true) && !vulnSyncDisabled {
 		go m.runVulnIntelSync()
 		// recent-critical fast lane: own goroutine + own lock, not dragged by the main
 		// sync's 30-minute rounds.
@@ -1063,10 +1104,33 @@ func (m *Manager) ProxyAddr() string {
 	if m.traffic != nil && m.TrafficEnabled() {
 		return m.traffic.ProxyAddr()
 	}
+	// The pool still applies with capture off: pick an exit straight from the pool for the Agent's HTTP_PROXY.
+	// An empty/fully tripped pool returns empty, falling back to the global proxy or direct.
+	if m.traffic != nil {
+		if p := m.traffic.ProxyPoolPick(""); p != "" {
+			return p
+		}
+		if m.traffic.StrictEgress() && m.traffic.ProxyPoolConfigured() {
+			// Pool configured but fully tripped: with a global proxy use it (still a proxy),
+			// otherwise return the sentinel address so the request fails — never fall back to direct.
+			m.mu.RLock()
+			g := m.globalProxy
+			m.mu.RUnlock()
+			if g != "" {
+				return g
+			}
+			return strictEgressBlockProxy
+		}
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
 }
+
+// strictEgressBlockProxy is the strict-egress sentinel address (connection always fails): better a
+// failed request than target traffic going out direct from the real IP. Same semantics as
+// traffic.strictBlockProxy.
+const strictEgressBlockProxy = "http://127.0.0.1:1"
 
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
 // the egress proxy. Non-empty ONLY when traffic capture is on (the MITM re-signs
@@ -1174,6 +1238,9 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.mihomo != nil {
+		_ = m.mihomo.Stop()
+	}
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
@@ -1593,8 +1660,10 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	    END,
 	    deadline_at=CASE
 	        WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN NULL
+	        WHEN paused_at IS NOT NULL AND deadline_at IS NOT NULL THEN deadline_at + (now() - paused_at)
 	        ELSE deadline_at
 	    END,
+	    paused_at=NULL,
 	    autopilot_extensions=CASE
 	        WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN 0
 	        ELSE autopilot_extensions
@@ -1651,7 +1720,7 @@ func (m *Manager) ApplyTaskPause(id string) error {
 	}
 	var mode string
 	err = m.pg.QueryRow(`UPDATE tasks
-		SET paused=true, queued=false, queued_at=NULL
+		SET paused=true, queued=false, queued_at=NULL, paused_at=now()
 		WHERE id=$1 AND deleted_at IS NULL AND paused=false
 		  AND status NOT IN ('done','failed','timeout')
 		RETURNING COALESCE(queue_mode,'')`, n).Scan(&mode)

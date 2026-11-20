@@ -14,7 +14,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +59,9 @@ func (m *Manager) RunProxyPoolHealthCheck() {
 	defer m.proxyCheckInFlight.Store(false)
 
 	st := loadProxyPoolState(m.pg)
+	if !st.Enabled {
+		return // master switch off: skip pointless probing
+	}
 	enabled := make([]traffic.PoolEntry, 0, len(st.Entries))
 	for _, e := range st.Entries {
 		if e.Enabled {
@@ -83,6 +89,34 @@ func (m *Manager) RunProxyPoolHealthCheck() {
 	}
 	if dead > 0 {
 		log.Printf("[proxypool] health check: %d/%d upstreams unavailable, circuit-broken", dead, len(enabled))
+		// Auto-restart a dead local mihomo process (only when the failing exit is loopback): mihomo is a
+		// local core the platform manages itself and has no systemd supervision; without auto-recovery the
+		// recording proxy's whole exit stays dead for a long time (measured on task 21: 6 hours, no traffic).
+		if dead == len(enabled) && m.mihomo != nil {
+			for _, e := range enabled {
+				u, err := url.Parse(e.URL)
+				if err != nil || u.Hostname() != "127.0.0.1" {
+					continue
+				}
+				port, _ := strconv.Atoi(u.Port())
+				if st, rerr := m.mihomo.RestartFromConfig(ctx, port); rerr != nil {
+					log.Printf("[proxypool] auto-restart of mihomo failed: %v", rerr)
+				} else if st.Running {
+					log.Printf("[proxypool] mihomo auto-restarted (port %d); the next health round re-verifies", st.Port)
+				}
+				break
+			}
+		}
+	}
+	// Non-empty pool but 0 available: must warn explicitly. Under strict egress requests fail fast
+	// (no real-IP leak); only non-strict mode falls back to direct/global proxy — the wording must
+	// differ or it misleads the worker.
+	if n := m.traffic.ProxyPoolAvailable(); n == 0 && len(enabled) > 0 {
+		if m.traffic.StrictEgress() && m.traffic.ProxyPoolConfigured() {
+			log.Printf("[proxypool] warning: all %d upstreams in the pool are unavailable and strict egress blocks direct — target requests fail fast (real IP not exposed); restore an upstream or disable strict egress for now", len(enabled))
+		} else {
+			log.Printf("[proxypool] warning: all %d upstreams in the pool are unavailable; task egress has fallen back to direct/global proxy (real IP exposed)", len(enabled))
+		}
 	}
 	// the page's 'last checked' timestamp shares the same snapshot as manual
 	// verification.
@@ -95,6 +129,43 @@ func (m *Manager) RunProxyPoolHealthCheck() {
 		"auto":     true,
 	}
 	m.proxyCheckMu.Unlock()
+	// Persist the trip results: the next restart still skips these dead proxies.
+	m.persistProxyBreaks()
+}
+
+// restoreProxyBreaks restores the trip state saved by the last process: without it, every exit
+// already judged dead becomes "available" again after a restart and tasks burn another round of
+// timeouts (measured on production: 231 of 240 dead proxies).
+func (m *Manager) restoreProxyBreaks() {
+	if m == nil || m.traffic == nil || m.pg == nil {
+		return
+	}
+	raw, ok, err := m.pg.GetSetting(settingProxyBreaks)
+	if err != nil || !ok || strings.TrimSpace(raw) == "" {
+		return
+	}
+	state := map[string]int64{}
+	if json.Unmarshal([]byte(raw), &state) != nil {
+		return
+	}
+	if n := m.traffic.RestoreProxyBreaks(state); n > 0 {
+		log.Printf("[proxypool] restored the trip state of %d exits (dead proxies stay dead across restarts)", n)
+	}
+}
+
+// persistProxyBreaks writes the current unexpired trip state back to settings, keeping it across restarts.
+func (m *Manager) persistProxyBreaks() {
+	if m == nil || m.traffic == nil || m.pg == nil {
+		return
+	}
+	state := m.traffic.SnapshotProxyBreaks()
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	if err := m.pg.SetSetting(settingProxyBreaks, string(raw)); err != nil {
+		log.Printf("[proxypool] failed to persist the trip state: %v", err)
+	}
 }
 
 // proxyTools returns the proxy-pool tools for agents. With capture off the pool isn't
@@ -136,18 +207,39 @@ func (s *Server) proxyStatusResult() (actool.Result, error) {
 		return actool.Errorf("proxy pool not initialized"), nil
 	}
 	st := s.loadProxyPool()
-	out := map[string]any{
-		"strategy":     st.Strategy,
-		"total":        len(st.Entries),
-		"capturing":    s.m.TrafficEnabled(),
-		"global_proxy": s.m.GlobalProxy() != "",
-		"upstreams":    s.m.traffic.ProxyPoolStatus(),
-		"health_check": settingOr(s.m.pg, settingProxyCheckTarget, defaultProxyCheckTarget),
+	available := 0
+	if s.m.traffic != nil {
+		available = s.m.traffic.ProxyPoolAvailable()
 	}
-	if len(st.Entries) == 0 {
+	eff, socks5Blocked := s.effectivePoolEntries(st)
+	out := map[string]any{
+		"enabled":        st.Enabled,
+		"strategy":       st.Strategy,
+		"total":          len(st.Entries),
+		"usable":         available,
+		"effective":      len(eff),
+		"socks5_blocked": socks5Blocked,
+		"capturing":      s.m.TrafficEnabled(),
+		"global_proxy":   s.m.GlobalProxy() != "",
+		"upstreams":      s.m.traffic.ProxyPoolStatus(),
+		"health_check":   settingOr(s.m.pg, settingProxyCheckTarget, defaultProxyCheckTarget),
+	}
+	if socks5Blocked > 0 {
+		out["socks5_note"] = fmt.Sprintf("%d socks5 upstreams are inactive due to the default policy (older versions panicked when socks5 dialing failed). Enable proxypool_allow_socks5 in settings to use them.", socks5Blocked)
+	}
+	switch {
+	case len(st.Entries) == 0:
 		out["note"] = "proxy pool empty: traffic leaves from this host directly (or via the 'global egress proxy'). Configure egress rotation under System → Proxy pool."
-	} else if !s.m.TrafficEnabled() {
-		out["note"] = "proxy pool configured but [traffic capture is off] so the pool isn't in effect — worker target traffic only rotates egress through the capture proxy."
+	case !st.Enabled:
+		out["note"] = "the proxy pool is disabled by its master switch: egress falls back to the global proxy/direct."
+	case available == 0:
+		if s.m.traffic != nil && s.m.traffic.StrictEgress() && s.m.traffic.ProxyPoolConfigured() {
+			out["note"] = "every upstream in the pool is currently tripped and strict egress blocks direct: target requests fail fast (real IP not exposed). Restore an upstream or disable strict egress before continuing."
+		} else {
+			out["note"] = "every upstream in the pool is currently tripped: egress has fallen back to direct/global proxy (real IP exposed). Verify connectivity before continuing."
+		}
+	case !s.m.TrafficEnabled():
+		out["note"] = "proxy pool enabled with traffic capture off: the Agent's Bash/WebFetch gets a pool exit injected directly, one upstream pinned per worker, no traffic records."
 	}
 	return jsonResult(out)
 }

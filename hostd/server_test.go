@@ -73,3 +73,28 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("abnormal healthz response: %s", w.Body.String())
 	}
 }
+
+// Audit B9: self-upgrade refuses a downgrade target — a helper newer than the target tag 400s so the
+// main program's version-reconcile loop (possibly running on a manually rolled-back main program)
+// can't drag it back.
+func TestSelfUpgradeRejectsDowngrade(t *testing.T) {
+	srv := NewServer(context.Background(), log.New(io.Discard, "", 0))
+	srv.Version = "v0.4.89"
+	post := func(tag string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"tag": tag})
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/self-upgrade", bytes.NewReader(body)))
+		return w
+	}
+	if w := post("v0.4.88"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "downgrade refused") {
+		t.Fatalf("a downgrade request should 400: code=%d body=%s", w.Code, w.Body.String())
+	}
+	// Upgrades and the same version still pass (up to the last gate before download — the CAS takes the upgrade lock and 202 returns here).
+	if w := post("v0.4.90"); w.Code != http.StatusAccepted {
+		t.Fatalf("an upgrade request should pass with 202: code=%d body=%s", w.Code, w.Body.String())
+	}
+	// The 202 above holds the upgrading lock; clean up by waiting for the CAS to recover (the goroutine fails its download).
+	for i := 0; i < 100 && !srv.upgrading.CompareAndSwap(true, false); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+}

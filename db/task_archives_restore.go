@@ -81,6 +81,17 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 	if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE task_id=$1`, taskID); err != nil {
 		return err
 	}
+	// 审计 F2：归档同样是「任务退出授权窗口」的时点——敏感凭据（密码/私钥密文）
+	// 不应继续保留；恢复后需要操作员重新录入。task_progress 一并清理。
+	if _, err := tx.Exec(`DELETE FROM credentials WHERE task_id=$1`, taskID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM credential_access_log WHERE task_id=$1`, taskID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM task_progress WHERE task_id=$1`, strconv.FormatInt(taskID, 10)); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM findings WHERE task_id=$1`, taskID); err != nil {
 		return err
 	}
@@ -318,6 +329,7 @@ func restoreTaskStub(tx *sql.Tx, row map[string]any, taskID, remaining int64) er
 	_, err = tx.Exec(`UPDATE tasks current SET
  name=archived.name,category_id=archived.category_id,description=archived.description,goal=archived.goal,
  status=archived.status,paused=archived.paused,queued=false,queued_at=NULL,queue_mode='',
+ paused_at=CASE WHEN archived.paused THEN now() ELSE NULL END,
  llm_profile_id=archived.llm_profile_id,active_llm_profile_id=archived.active_llm_profile_id,
  llm_chain_revision=archived.llm_chain_revision,company_id=archived.company_id,parent_ref=archived.parent_ref,
  timeout_seconds=archived.timeout_seconds,plan_heartbeat_seconds=archived.plan_heartbeat_seconds,

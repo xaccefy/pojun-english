@@ -13,7 +13,19 @@ func TestInterceptApprovalFilters(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	scope := "approval-filter-" + t.Name()
 	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id IN ($1,$2)`, scope, scope+"-other") })
-	rule, err := d.CreateInterceptRule("filter fixture", "tool_name", "string", "Bash", "deny", "fixture", 1, true, false, 0, "deny")
+	rule, err := d.CreateInterceptRule(InterceptRuleInput{
+		Name:           "filter fixture",
+		MatchTarget:    "tool_name",
+		MatchType:      "string",
+		Pattern:        "Bash",
+		Action:         "deny",
+		Message:        "fixture",
+		Priority:       1,
+		Enabled:        true,
+		TimeoutEnabled: false,
+		TimeoutSeconds: 0,
+		TimeoutAction:  "deny",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

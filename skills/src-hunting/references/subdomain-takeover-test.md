@@ -44,7 +44,7 @@ Subdomain takeover occurs when:
 | Tool | Purpose |
 |---|---|
 | `subjack` | Automated CNAME takeover checking |
-| `nuclei -t takeovers/` | Nuclei takeover detection templates |
+| `nuclei -t takeovers/ ${EGRESS_PROXY:+-proxy "$EGRESS_PROXY"}` | Nuclei takeover detection templates (with an egress proxy configured, `-proxy` is mandatory) |
 | `can-i-take-over-xyz` (GitHub) | Reference for which services are vulnerable |
 | `dnsreaper` | Multi-provider takeover scanner |
 | `subzy` | Fast subdomain takeover verification |

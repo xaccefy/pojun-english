@@ -16,7 +16,10 @@
 set -u
 
 HOSTD_SOCK="/run/pojun/hostd.sock"
-PREINSTALL_MARK="/app/data/.tools-preinstall-done"
+# 标记放**容器层**而不是 data 卷：预装出来的工具落在容器可写层，镜像升级重建
+# 容器后「工具没了、标记还在」会导致永久跳过预装、工具静默消失。标记随容器
+# 生命周期走，重建即重跑（预装本身幂等：已装好的逐项跳过，开销只有探测）。
+PREINSTALL_MARK="/app/.tools-preinstall-done"
 PREINSTALL_LOG="/app/data/tools-preinstall.log"
 mkdir -p "$(dirname "$HOSTD_SOCK")" /app/data
 

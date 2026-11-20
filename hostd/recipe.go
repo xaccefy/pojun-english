@@ -188,9 +188,9 @@ func pipArgv(tool hosttools.Tool, proxy string) []string {
 // Asset naming varies a lot across projects (architecture first or last, version with or
 // without v, extension .zip/.tar.gz/.gz), so the template must cover those differences;
 // otherwise "one-click install" only works for half the projects.
-func GitHubAssetURL(tool hosttools.Tool, tag string) string {
+func GitHubAssetURL(tool hosttools.Tool, assetTmpl, tag string) string {
 	ver := strings.TrimPrefix(tag, "v")
-	asset := strings.ReplaceAll(tool.AssetTmpl, "{ver}", ver)
+	asset := strings.ReplaceAll(assetTmpl, "{ver}", ver)
 	asset = strings.ReplaceAll(asset, "{verv}", tag)
 	asset = strings.ReplaceAll(asset, "{arch}", hosttools.Arch())
 	asset = strings.ReplaceAll(asset, "{arch2}", hosttools.ArchAlt())

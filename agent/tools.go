@@ -1676,7 +1676,7 @@ func (t *ToolSet) retireIntent() actool.CoreTool {
 const maxIntentRetirePerRun = 6
 
 func reasonClaimsPremiseInvalid(reason string) bool {
-	for _, w := range []string{"premise", "negated", "invalidated", "disproved", "answered", "dead goal", "premise", "negated", "invalidated", "disproved", "already answered", "dead goal"} {
+	for _, w := range []string{"premise", "negated", "invalidated", "disproved", "answered", "already answered", "dead goal"} {
 		if strings.Contains(reason, w) {
 			return true
 		}
@@ -1760,6 +1760,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id must be a fact/vuln node of this task or a directly related task"), nil
 			}
+			if msg := capabilityEvidenceError(goalNode, evidenceNode); msg != "" {
+				return actool.Errorf(msg), nil
+			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
 			// Each time a goal is marked met, check whether [all goals] of this task are met; if so, auto-judge
@@ -1837,12 +1840,14 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"vulnclass": str("Vuln class — [must] pick from the standard classes: " + db.VulnClassPromptText() + ". Put a concrete CVE/vuln number in name and pick 'known vuln' as the class; only use 'other' when truly nothing fits"), "name": str("vuln name"), "severity": str("critical|high|medium|low"), "summary": str("finding summary"),
 		"intent_id": idp("the current task's intent id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "affected asset ids"},
 		"evidence":         str("evidence/PoC text"),
+		"root_cause_key":   str("optional: a stable short key identifying the same root cause across endpoints (e.g. jwt-alg-none, idor-order-owner). Findings with the same key on different endpoints are merged by it; omit when unsure — omitting only merges less, it never merges wrongly."),
 		"evidence_hint_id": idp("optional: this task's hint node id corresponding to this vuln — auto-carries its structured traffic_refs; can't reference an inherited hint or another vuln's hint"),
 		"traffic_refs": map[string]any{"type": "array", "description": "optional; for HTTP/HTTPS vulns first search and verify each request/response actually supports the vuln conclusion, then fill real IDs in replay order. For non-HTTP vulns like TCP, or when nothing was captured / no exact record found, omit or pass [] — the report isn't blocked; explain in evidence and provide other verifiable evidence instead. Don't guess IDs, infer association by domain/time, or re-probe just to fill. Roles: baseline = normal control / proof = vuln proof / verification = supplementary verification / supporting = auxiliary evidence. If an ID doesn't exist, the vuln still stores normally and that ID is listed in the return's skipped_traffic_refs — verify real IDs with traffic_get and rebind via bind_finding_traffic.",
 			"items": obj(map[string]any{"traffic_id": str("a real traffic ID returned by traffic_search"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("how this traffic supports the vuln conclusion")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			RootCauseKey                                 string            `json:"root_cause_key"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1921,7 +1926,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if msg := t.scopeGuardError(pidList(a.AssetIDs)); msg != "" {
 			return actool.Errorf(msg), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CrossTaskNotifyDedup: t.CrossTaskNotifyDedup}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, RootCauseKey: a.RootCauseKey, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CrossTaskNotifyDedup: t.CrossTaskNotifyDedup}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)

@@ -14,6 +14,7 @@ package vulnintel
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -126,6 +127,59 @@ type ScanArgs struct {
 	CVEID        string        // optional: restrict to templates mentioning this CVE
 	Severity     string        // optional: comma list critical,high,medium,low
 	TimeoutTotal time.Duration // whole-run ceiling (default 10m, cap 30m)
+	// Proxy is the egress proxy URL (may be empty). Empty = direct, and -proxy never appears in the
+	// command — nuclei's -proxy is a string[], and an empty entry breaks proxy parsing.
+	Proxy string
+}
+
+// EffectiveTimeout normalizes the whole-run ceiling: <=0 becomes 10m, >30m is clamped to 30m.
+// BuildNucleiCmd and the agent-side GNU timeout wrapper share this rule so the two clamps can't drift.
+func EffectiveTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 10 * time.Minute
+	}
+	if d > 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return d
+}
+
+// normalizeNucleiProxy normalizes the ToolSet egress proxy into the form nuclei's -proxy accepts.
+// Same rule as the agent-side buildHTTPClient: http:// is added only when the scheme is missing and never
+// unconditionally (production values always carry http:// via traffic.ProxyAddr, so unconditional prefixing
+// would produce http://http://…). Empty/whitespace = direct, the caller emits no -proxy. Any comma is refused:
+// -proxy is a string[] and a comma is read as a multi-proxy separator, silently splitting a URL whose password
+// contains one (under -silent that looks like "no hits"). No percent-encoding here — the proxy may not accept
+// encoded userinfo, so an explicit error is better.
+// A port is mandatory: nuclei v3.11.1 does a TCP liveness check on Hostname():Port() at startup and calls
+// Logger.Fatal without one, so the tool layer must error early to give a readable reason.
+func normalizeNucleiProxy(raw string) (string, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", nil
+	}
+	if strings.Contains(p, ",") {
+		return "", fmt.Errorf("proxy address contains a comma (%q): nuclei reads -proxy as a multi-proxy list, use an address without one", p)
+	}
+	if !strings.Contains(p, "://") {
+		p = "http://" + p
+	}
+	u, err := url.Parse(p)
+	if err != nil {
+		return "", fmt.Errorf("proxy address cannot be parsed (%q): %v", p, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5":
+	default:
+		return "", fmt.Errorf("unsupported proxy scheme (%q): only http/https/socks5 are accepted", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("proxy address has no host (%q)", p)
+	}
+	if u.Port() == "" {
+		return "", fmt.Errorf("proxy address has no port (%q): nuclei probes host:port at startup and exits without one", p)
+	}
+	return p, nil
 }
 
 // BuildNucleiCmd assembles the nuclei invocation. Templates restricted to the
@@ -140,13 +194,7 @@ func BuildNucleiCmd(ctx context.Context, templatesDir string, a ScanArgs) (*exec
 	if _, err := os.Stat(filepath.Join(templatesDir, ".git")); err != nil {
 		return nil, nil, fmt.Errorf("template tree unavailable (%s): wait for the synchronizer to finish initializing", templatesDir)
 	}
-	timeout := a.TimeoutTotal
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
-	if timeout > 30*time.Minute {
-		timeout = 30 * time.Minute
-	}
+	timeout := EffectiveTimeout(a.TimeoutTotal)
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 
 	args := []string{
@@ -156,6 +204,15 @@ func BuildNucleiCmd(ctx context.Context, templatesDir string, a ScanArgs) (*exec
 		"-silent",
 		"-no-color",
 		"-disable-update-check",
+	}
+	// Egress proxy: traffic capture / global proxy / the strict-egress sentinel all flow in through
+	// ToolSet.egressProxy. It must be emitted here: scan_with_nuclei only assembles the command and Bash runs
+	// nuclei, and "nuclei's env support is unstable" can't be enforced by the prompt alone.
+	if prox, perr := normalizeNucleiProxy(a.Proxy); perr != nil {
+		cancel()
+		return nil, nil, perr
+	} else if prox != "" {
+		args = append(args, "-proxy", prox)
 	}
 	if cve := strings.TrimSpace(a.CVEID); cve != "" {
 		templates := FindNucleiTemplates(templatesDir, cve)

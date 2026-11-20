@@ -12,18 +12,25 @@ func TestParseAuthEntriesRecognizesCommonKeys(t *testing.T) {
 	raw := []map[string]any{
 		{"type": "wordpress", "username": "admin", "password": "p@ss"},
 		{"type": "bearer", "token": "abc.def.ghi"},
-		{"user": "bob", "pass": "secret"},      // key-name variant
+		{"user": "bob", "pass": "secret"},       // key-name variant
 		{"token": "tk", "description": "admin"}, // with description
-		{"nothing": "here"},                   // no usable field → doesn't count
+		{"nothing": "here"},                     // no usable field → placeholder (order kept)
 	}
 	entries := parseAuthEntries(raw)
-	// 4 valid credentials (wordpress / bearer / bob / tk); the 5th has no usable field and is skipped.
-	if len(entries) != 4 {
-		t.Fatalf("parsed %d credentials, should be 4 (no-usable-field ones don't count)", len(entries))
+	// Audit F1: output must be the same length and order as the input array — list_assets shows
+	// the model the raw array order, and session_login's auth_index must share that source, or the
+	// credential the model picked differs from the one actually sent.
+	if len(entries) != 5 {
+		t.Fatalf("parsed %d entries, should be 5 (same length as the input array, invalid entries as placeholders)", len(entries))
 	}
-	// Token kinds sort first (default auth_index=0 grabs the most convenient).
-	if entries[0].Token == "" {
-		t.Errorf("token credentials should sort first, got %+v", entries[0])
+	if entries[0].Username != "admin" || entries[0].Password != "p@ss" {
+		t.Errorf("entries[0] should keep the original order: %+v", entries[0])
+	}
+	if entries[1].Token != "abc.def.ghi" {
+		t.Errorf("entries[1] should keep the original order: %+v", entries[1])
+	}
+	if entries[4].valid() {
+		t.Errorf("invalid entry should hold a zero value: %+v", entries[4])
 	}
 	// Key-name variants must be recognized.
 	found := false
@@ -35,13 +42,23 @@ func TestParseAuthEntriesRecognizesCommonKeys(t *testing.T) {
 	if !found {
 		t.Error("key-name variant (user/pass) not recognized")
 	}
+	// The valid-index hint must exclude invalid entries.
+	if got := validAuthIndices(entries); got != "0,1,2,3" {
+		t.Errorf("validAuthIndices=%q, want 0,1,2,3", got)
+	}
 }
 
-// No credentials → empty return; the tool must honestly report 'no credentials registered', never fabricate.
+// With no credentials it returns a same-length placeholder list (the caller errors via valid()); the tool
+// reports 'no credentials registered'.
 func TestParseAuthEntriesEmptyWhenNoUsableFields(t *testing.T) {
 	entries := parseAuthEntries([]map[string]any{{"foo": "bar"}, {"note": "x"}})
-	if len(entries) != 0 {
-		t.Errorf("empty auth field should return empty, got %d", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("no credential fields must still match the input array length, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.valid() {
+			t.Errorf("invalid entry should be a zero-value placeholder: %+v", e)
+		}
 	}
 }
 

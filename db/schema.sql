@@ -396,6 +396,9 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- Custom session header: when non-empty, every request carries an HTTP header with this name, value=the running session id
     -- (chat conversation/worker intent). For gateways that use a session-id header for prompt caching/sticky routing. ''=do not send.
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- User-Agent for LLM requests. ''=no override (keep the SDK/Go default); non-empty=send this value on every request.
+    -- For gateways/WAFs that reject the default Go-http-client UA outright. See agent.Config.UserAgent.
+    user_agent         TEXT NOT NULL DEFAULT '',
     -- Retry overrides: count 0=global default / -1=off / >0=that value; interval 0=default exponential backoff / >0=fixed milliseconds.
     -- The three groups are connect retry, empty-response retry, and same-provider safe-window retry; see the ALTER comments below.
     retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
@@ -435,6 +438,9 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- Custom session header name; backfills old databases. Default '' = do not send, old configs unchanged.
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- LLM 请求 User-Agent；补旧库。默认 '' = 不覆盖(保持 SDK/Go 默认)，旧配置行为不变。
+-- 非空时由 agent 的 RoundTripper 给每个模型请求注入该 UA，用于绕开拦截默认 UA 的网关/WAF。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT '';
 
 -- Per-config retry overrides (see docs/llm-retry-design.md). Each of the three groups is a pair of "count + fixed interval",
 -- with uniform semantics: count 0=use the global default, -1=disable that retry layer, >0=use that value; interval 0=use that layer's
@@ -514,6 +520,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status         TEXT NOT NULL DEFAULT 'created'
                      CHECK (status IN ('created','running','paused','done','failed','timeout')),
     paused         BOOLEAN NOT NULL DEFAULT false,
+    -- 暂停开始时间：恢复时据此把暂停时长从任务 deadline 预算里剔除。
+    paused_at      TIMESTAMPTZ,
     queued         BOOLEAN NOT NULL DEFAULT false,
     queued_at      TIMESTAMPTZ,
     queue_mode     TEXT NOT NULL DEFAULT '',
@@ -555,6 +563,9 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 -- the DB and every API response masks them (see db/task_auth.go). NULL=not configured.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
+-- Pause start time; backfills old databases. NULL=not currently paused. On resume, deadline_at is
+-- pushed out by (now-paused_at) so an out-of-window sleep doesn't eat the task's effective run budget.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ;
 -- Optional task name; backfills old databases. Empty string=unnamed, and the frontend falls back to the description when displaying.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
@@ -1074,6 +1085,11 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     priority        INTEGER NOT NULL DEFAULT 0,
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
     match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex')),
+    -- tool_scope 限定本条规则对哪些工具生效（JSON 字符串数组；空数组 = 全部工具）。
+    -- 只对 match_target=tool_input 有实际意义：它匹配的是整段入参 JSON，同一串
+    -- 字符出现在写文件工具的正文里是数据、出现在命令字段里才是命令，纯正则无法
+    -- 区分，工具身份才是无歧义的信号。
+    tool_scope      JSONB NOT NULL DEFAULT '[]',
     pattern         TEXT NOT NULL,
     action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask', 'judge')),
     message         TEXT NOT NULL DEFAULT '',
@@ -1090,6 +1106,8 @@ CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
 ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_action_check;
 ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_action_check
     CHECK (action IN ('allow', 'deny', 'ask', 'judge'));
+-- 规则级适用工具范围（补旧库）。空数组 = 不限工具，与加列前的行为完全一致。
+ALTER TABLE intercept_rules ADD COLUMN IF NOT EXISTS tool_scope JSONB NOT NULL DEFAULT '[]';
 
 CREATE TABLE IF NOT EXISTS intercept_pending (
     id              BIGSERIAL PRIMARY KEY,
@@ -1573,3 +1591,34 @@ CREATE TABLE IF NOT EXISTS finding_updates (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_finding_updates_finding ON finding_updates(finding_id, id DESC);
+
+-- ============================================================================
+-- 凭据保险库（v0.4.83）：供 SSH 跳板出口等「需要保存密码/私钥」的功能使用。
+-- 密文列由 vault 包加解密（XChaCha20-Poly1305，主密钥在 data/vault.key）；
+-- 表在这里保证任何入口（含不初始化 vault 的场景）都存在，删除任务时可清理。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS credentials (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL DEFAULT 0,
+    asset_id BIGINT NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    secret_enc BYTEA NOT NULL,
+    secret_hint TEXT NOT NULL DEFAULT '',
+    privilege TEXT NOT NULL DEFAULT '',
+    meta JSONB NOT NULL DEFAULT '{}',
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_task ON credentials(task_id, asset_id);
+CREATE TABLE IF NOT EXISTS credential_access_log (
+    id BIGSERIAL PRIMARY KEY,
+    credential_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL DEFAULT 0,
+    intent_id BIGINT NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credential_audit ON credential_access_log(credential_id, at DESC);

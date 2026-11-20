@@ -24,6 +24,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { api } from "@/lib/api";
 import type { HostenvStatus, HostTool, InstallJob, ProxyCheckResult } from "@/lib/types";
 
+import { InstallSources } from "./install-sources";
+
 const TERMINAL_STATES = new Set(["done", "failed", "cancelled"]);
 
 const KIND_LABEL: Record<HostTool["kind"], string> = {
@@ -313,7 +315,7 @@ export default function HostEnvPage() {
             </Button>
           </div>
         </CardHeader>
-        <CardContent className="flex flex-col gap-4">
+        <CardContent id="install-proxy-settings" className="flex flex-col gap-4">
           {!loaded ? (
             <div className="space-y-2">
               {Array.from({ length: 6 }).map((_, i) => (
@@ -340,7 +342,9 @@ export default function HostEnvPage() {
                       </Badge>
                     )}
                     <span className="text-muted-foreground text-xs">
-                      {installerReady ? "Used when installing things (apt / GitHub downloads)" : "Host helper not running, temporarily unavailable"}
+                      {installerReady
+                        ? "Used for tool installs and program updates"
+                        : "Tool installs need the host helper; program updates can still use this proxy"}
                     </span>
                   </div>
                 </div>
@@ -390,9 +394,19 @@ export default function HostEnvPage() {
                 )}
                 <p className="text-muted-foreground text-xs">
                   In domestic (Chinese) environments, installing tools that go through GitHub Release like nuclei usually requires it; it does not affect the "global proxy" (Agent
-                  target traffic). The proxy can be changed anytime; after changing, click "Test" to confirm the path — proxies expire, so when a tool installation fails, check here first.
+                  target traffic). Leave empty to use the deployment environment's <code>POJUN_INSTALL_PROXY</code> (if set).
+                  After changing it, click "Test" to check the path first; once saved, retry the GitHub connection under
+                  "Version and update" — proxies expire, so when a tool installation fails, check here first.
                 </p>
               </div>
+
+              {inv && (
+                <InstallSources
+                  sources={inv.installer.sources ?? { apt: "", pypi: "" }}
+                  supported={!!inv.installer.sources_supported}
+                  onSaved={(sources) => setInv((prev) => prev && { ...prev, installer: { ...prev.installer, sources } })}
+                />
+              )}
 
               {!installerReady && inv?.installer.reason && (
                 <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">

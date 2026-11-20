@@ -118,6 +118,24 @@ per request), evidence attachments, and task workspaces are all small-file inten
 - Upgrade: change `POJUN_TAG` in `.env`, then `docker compose -f ... -f ... pull && up -d`;
 - skills/ keeps the bind mount (a few read-only files, NTFS read overhead is acceptable) — editing a skill avoids rebuilding the image.
 
+## 0e. macOS Docker deployment (Docker Desktop / OrbStack, from v0.4.72)
+
+Running the Docker container form on macOS: a plain `up -d` of the official `docker-compose.yml` starts the main
+service, but there are three macOS-specific gaps (bind-mount I/O, callback ports, directory permissions), so the macOS
+override is recommended:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.macos.yml up -d
+```
+
+- `docker-compose.macos.yml`: the data volume becomes a named volume (macOS bind mounts go through
+  VirtioFS/gRPC-FUSE and small-file I/O is likewise an order of magnitude slower — traffic/evidence are small-file
+  heavy), and callback ports 4444-4450 are pre-mapped;
+- callback receiver: in the container's direct mode LHOST is the container subnet IP, unreachable from external
+  targets — on the "Listener / C2" page set the exit form to **manual** and fill in the host's LAN IP from
+  `ipconfig getifaddr en0`, with listen ports corresponding 1:1 to the mapped ports;
+- for the macOS **native binary** form (not Docker) see §0d.
+
 ## 0d. macOS Deployment (Run Prebuilt Package Directly, from v0.4.66)
 
 macOS and Linux are both unix, so the main service (a pure-Go single binary) and the `start.sh` daemon script work directly;
@@ -629,6 +647,22 @@ GitHub Release: nuclei/httpx/subfinder/naabu/dnsx/katana/tlsx/notify/
 interactsh/gitleaks/chisel/amass/dalfox/feroxbuster;
 Also installs SecLists, pip tools, Playwright MCP + chromium, and **official-document fonts**
 (`/usr/share/fonts/gongwen`, pulled from the repo raw, failure only warns).
+
+### Host tool install sources
+
+Under "System → Host environment → Install sources" choose the system default, the Tencent Cloud mirror or the
+Tsinghua TUNA mirror for APT and PyPI. Once saved, new single installs and "install all" jobs use the chosen sources.
+With a mirror in use, the install proxy can still be set separately per network environment.
+
+- **APT** recognizes supported Debian, Ubuntu and Kali official sources in `/etc/apt/sources.list` and
+  `/etc/apt/sources.list.d/`. Only this APT job's mirror addresses are substituted; existing signature checks,
+  distribution, architecture and third-party repo entries keep working as before. Self-built sources, DNF or tools
+  bundled in the Docker image keep their deployment's package-management path.
+- A **PyPI** mirror becomes the primary index for `pip` and `pipx` install jobs. Choosing "system default" restores
+  the host helper's original configuration.
+- The **Git** manual-download option converts a public GitHub repository address into a `gh-proxy.cn` clone address.
+  Verify the commit against upstream after a manual clone. Program updates and GitHub downloads inside install-all
+  keep using the install proxy.
 
 ## Data Disk Expansion and Migration (Tested on Kali 2026-11-02)
 
