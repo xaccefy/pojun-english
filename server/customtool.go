@@ -387,14 +387,17 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	}
 	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, timeoutOr(spec.TimeoutMs, 120000))
 	if err != nil {
-		return actool.Errorf(err.Error()), nil
+		if body == "" {
+			body = err.Error()
+		}
+		return actool.Errorf(actool.Capture(tc, body)), nil
 	}
 	return actool.Text(actool.Capture(tc, body)), nil
 }
 
 // execPython writes the code to a temp .py under workDir/.tools, runs it via interp
 // with the params JSON on stdin + scalar params mirrored to TOOL_<NAME> env, and
-// returns combined stdout+stderr (with a timeout/exit note). Standalone + testable.
+// returns combined stdout+stderr (with a timeout/exit note) and any execution error.
 func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration) (string, error) {
 	toolsDir := filepath.Join(workDir, ".tools")
 	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
@@ -426,12 +429,18 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 	c.Stdin = bytes.NewReader(pj) // param JSON over stdin
 	out, err := c.CombinedOutput()
 	body := string(out)
-	if runCtx.Err() == context.DeadlineExceeded {
+	if err == nil {
+		return body, nil
+	}
+	if ctxErr := runCtx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if err == context.DeadlineExceeded {
 		body += "\n... [killed on timeout] ..."
-	} else if err != nil {
+	} else {
 		body += "\n[exit: " + err.Error() + "]"
 	}
-	return body, nil
+	return body, err
 }
 
 // ---------- http: native request + proxy ----------
