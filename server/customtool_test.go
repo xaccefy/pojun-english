@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
 )
 
 func TestRenderTemplateCommand(t *testing.T) {
@@ -104,6 +108,109 @@ print("port=" + str(a["port"]))
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestExecPythonFailurePreservesOutput(t *testing.T) {
+	interp, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 unavailable")
+	}
+	out, err := execPython(context.Background(), interp, "test",
+		"import sys\nprint('partial stdout', flush=True)\nprint('failure stderr', file=sys.stderr, flush=True)\nsys.exit(7)\n",
+		nil, t.TempDir(), nil, 10*time.Second)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("error = %v, want exit code 7", err)
+	}
+	for _, want := range []string{"partial stdout", "failure stderr", "exit status 7"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output lost %q: %s", want, out)
+		}
+	}
+}
+
+func TestExecPythonReportsContextErrors(t *testing.T) {
+	interp, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 unavailable")
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []struct {
+		name     string
+		ctx      context.Context
+		wantErr  error
+		wantText string
+	}{
+		{name: "timeout", ctx: context.Background(), wantErr: context.DeadlineExceeded, wantText: "killed on timeout"},
+		{name: "cancelled", ctx: cancelled, wantErr: context.Canceled, wantText: "context canceled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := execPython(tc.ctx, interp, "test", "import threading\nthreading.Event().wait()\n",
+				nil, t.TempDir(), nil, 2*time.Second)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			if !strings.Contains(out, tc.wantText) {
+				t.Fatalf("missing failure reason %q: %s", tc.wantText, out)
+			}
+		})
+	}
+}
+
+func TestCustomScriptToolReportsExecutionFailures(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 unavailable")
+	}
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skipf("database unavailable: %v", err)
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Skipf("database unavailable: %v", err)
+	}
+	defer pg.Close()
+	s := &Server{m: &Manager{pg: pg, dir: t.TempDir()}}
+	cases := []struct {
+		name, code string
+		timeoutMS  int
+		wantError  bool
+		wantText   []string
+	}{
+		{name: "success", code: "print('completed')", wantText: []string{"completed"}},
+		{name: "nonzero exit", code: "import sys\nprint('partial stdout', flush=True)\nprint('failure stderr', file=sys.stderr, flush=True)\nsys.exit(7)", wantError: true, wantText: []string{"partial stdout", "failure stderr", "exit status 7"}},
+		{name: "timeout", code: "import threading\nthreading.Event().wait()", timeoutMS: 2000, wantError: true, wantText: []string{"killed on timeout"}},
+		{name: "large failure output", code: "import sys\nprint('x' * 40000)\nprint('failure stderr', file=sys.stderr, flush=True)\nsys.exit(7)", wantError: true, wantText: []string{"failure stderr", "exit status 7"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(scriptExec{Code: tc.code, TimeoutMs: tc.timeoutMS})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tool := s.buildCustomTool(&db.Tool{Key: "test_script", Kind: "script", Exec: raw})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res, err := tool.Call(ctx, json.RawMessage(`{}`), &actool.ToolContext{WorkingDir: t.TempDir()})
+			if err != nil {
+				t.Fatalf("tool call error: %v", err)
+			}
+			if res.IsError != tc.wantError {
+				t.Fatalf("IsError = %v, want %v; output: %s", res.IsError, tc.wantError, res.Flatten())
+			}
+			out := res.Flatten()
+			for _, want := range tc.wantText {
+				if !strings.Contains(out, want) {
+					t.Fatalf("missing %q: %s", want, out)
+				}
+			}
+			if tc.name == "large failure output" && len(out) >= 40000 {
+				t.Fatalf("failure output was not capped: %d bytes", len(out))
+			}
+		})
 	}
 }
 
