@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,11 +117,37 @@ func (t *ToolSet) saveScript() actool.CoreTool {
 		})
 }
 
+func scriptInterpreter(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	header, err := bufio.NewReader(f).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if strings.HasPrefix(header, "#!") {
+		interpreter := strings.TrimSpace(strings.TrimPrefix(header, "#!"))
+		if split := strings.IndexAny(interpreter, " \t"); split >= 0 {
+			// The shebang's optional argument is passed as one argument, including env -S.
+			return []string{interpreter[:split], strings.TrimSpace(interpreter[split:])}, nil
+		}
+		if interpreter != "" {
+			return []string{interpreter}, nil
+		}
+	}
+	if strings.EqualFold(filepath.Ext(path), ".py") {
+		return []string{"python3"}, nil
+	}
+	return []string{"bash"}, nil
+}
+
 // runScript builds a command executing a shared script (goes to Bash — guard/traffic/audit preserved).
 func (t *ToolSet) runScript() actool.CoreTool {
 	return readTool("run_script",
 		"Builds a command running a task-shared script (builds only — Bash executes). The script must already exist under "+
-			"tasks/<id>/shared/scripts (written via save_script). Supports args and timeout; returns a ready-to-run command.",
+			"tasks/<id>/shared/scripts (written via save_script). Uses the script's shebang; without one, .py uses python3 and other files use Bash. Supports args and timeout; returns a ready-to-run command.",
 		obj(map[string]any{
 			"path":    str("script path (the path save_script returned, or a filename relative to shared/scripts)"),
 			"args":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "argument list (optional)"},
@@ -155,6 +183,10 @@ func (t *ToolSet) runScript() actool.CoreTool {
 			if info, err := os.Stat(abs); err != nil || !info.Mode().IsRegular() {
 				return actool.Errorf("script does not exist: " + abs), nil
 			}
+			interpreter, err := scriptInterpreter(abs)
+			if err != nil {
+				return actool.Errorf("failed to read the script: " + err.Error()), nil
+			}
 			timeout := a.Timeout
 			if timeout <= 0 {
 				timeout = 120
@@ -163,7 +195,11 @@ func (t *ToolSet) runScript() actool.CoreTool {
 				timeout = 1800
 			}
 			q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
-			parts := []string{"timeout", fmt.Sprint(timeout), "bash", q(abs)}
+			parts := []string{"timeout", fmt.Sprint(timeout)}
+			for _, arg := range interpreter {
+				parts = append(parts, q(arg))
+			}
+			parts = append(parts, q(abs))
 			for _, arg := range a.Args {
 				parts = append(parts, q(arg))
 			}
